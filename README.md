@@ -122,6 +122,65 @@ missing, so you're never left at a raw error:
 
 ---
 
+## Corporate / proxy setup
+
+If Anthropic's API is not directly reachable (corporate network, internal proxy), configure the
+CLI once — the extension inherits it automatically:
+
+### 1 — Create `~/.claude/settings.json`
+
+```jsonc
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "<your-token>",
+    "ANTHROPIC_BASE_URL": "http://<proxy-host>:<port>/anthropic/",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "claude-haiku-4-5"
+  }
+}
+```
+
+> `ANTHROPIC_BASE_URL` replaces the default `https://api.anthropic.com` with your proxy endpoint.
+> All other CLI and extension traffic (including MCP calls) flows through it automatically.
+
+Verify the file was picked up:
+
+```powershell
+Get-Content "$env:USERPROFILE\.claude\settings.json" | Select-String "ANTHROPIC"
+```
+
+### 2 — Register MCP servers (once, permanent)
+
+MCP servers must be registered via the CLI — **not** by editing `mcp.json` directly (that is a
+legacy format the current CLI ignores for connections):
+
+```powershell
+# SAP Business One MCP (SSE)
+claude mcp add B1mcp --scope user --transport sse http://<b1-host>:<port>/sse
+
+# Visual Studio 2026 bridge MCP — only needed when you use the VS debug/semantic tools
+# Start the bridge from VS first (menu action), then register:
+claude mcp add visualstudio --scope user --transport sse http://localhost:5050/sse
+```
+
+> `--scope user` writes the entry permanently to `~/.claude.json`.
+> You register each server **once** — not per session.
+
+Check registered servers and their health:
+
+```powershell
+claude mcp list
+```
+
+### 3 — Restart Visual Studio
+
+The extension reads MCP server configuration from the CLI at session start.
+After any change to `settings.json` or `claude mcp add/remove`, restart VS (or use
+**Restart this tab** in the Context panel for MCP-only changes).
+
+---
+
 ## Install
 
 ### From a release VSIX (recommended)

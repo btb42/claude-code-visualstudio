@@ -15,12 +15,23 @@ namespace ClaudeCode.VisualStudio.Services
 
     public sealed class SessionRecord
     {
+        public string TabId { get; set; }      // which tab this record belongs to
+        public string TabTitle { get; set; }   // user-visible tab label
         public string SessionId { get; set; }
         public string Model { get; set; } = "default";
         public string Mode { get; set; } = "default";
         public string Effort { get; set; } = "none";
         public bool ShowThinking { get; set; } = true;
         public List<StoredMessage> Messages { get; set; } = new List<StoredMessage>();
+    }
+
+    /// <summary>
+    /// Wraps a list of tab sessions for a single working directory.
+    /// </summary>
+    public sealed class SessionBundle
+    {
+        public List<SessionRecord> Tabs { get; set; } = new List<SessionRecord>();
+        public string ActiveTabId { get; set; }
     }
 
     /// <summary>
@@ -52,23 +63,22 @@ namespace ClaudeCode.VisualStudio.Services
         {
             try
             {
-                var path = FileFor(cwd);
-                if (!File.Exists(path)) return null;
-                var json = ReadDecrypted(path);
-                return json == null ? null : JsonSerializer.Deserialize<SessionRecord>(json);
+                var bundle = LoadBundle(cwd);
+                return bundle?.Tabs?.Count > 0 ? bundle.Tabs[0] : null;
             }
             catch { return null; }
         }
 
         public static void Save(string cwd, SessionRecord rec)
         {
+            if (rec == null) return;
             try
             {
-                if (rec == null) return;
-                Directory.CreateDirectory(Dir);
-                if (rec.Messages != null && rec.Messages.Count > MaxMessages)
-                    rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
-                WriteEncrypted(FileFor(cwd), JsonSerializer.Serialize(rec));
+                var bundle = LoadBundle(cwd) ?? new SessionBundle();
+                var existing = bundle.Tabs.FindIndex(t => t.TabId == rec.TabId);
+                if (existing >= 0) bundle.Tabs[existing] = rec;
+                else bundle.Tabs.Add(rec);
+                SaveBundle(cwd, bundle);
             }
             catch { }
         }
@@ -76,6 +86,54 @@ namespace ClaudeCode.VisualStudio.Services
         public static void Clear(string cwd)
         {
             try { var p = FileFor(cwd); if (File.Exists(p)) File.Delete(p); }
+            catch { }
+        }
+
+        public static void ClearTab(string cwd, string tabId)
+        {
+            try
+            {
+                var bundle = LoadBundle(cwd);
+                if (bundle == null) return;
+                bundle.Tabs.RemoveAll(t => t.TabId == tabId);
+                if (bundle.Tabs.Count == 0) Clear(cwd);
+                else SaveBundle(cwd, bundle);
+            }
+            catch { }
+        }
+
+        public static SessionBundle LoadBundle(string cwd)
+        {
+            try
+            {
+                var path = FileFor(cwd);
+                if (!File.Exists(path)) return null;
+                var json = ReadDecrypted(path);
+                if (json == null) return null;
+                // Try new bundle format first, fall back to legacy single-record format.
+                if (json.TrimStart().StartsWith("{\"Tabs\"", StringComparison.OrdinalIgnoreCase) ||
+                    json.TrimStart().StartsWith("{\"tabs\"", StringComparison.OrdinalIgnoreCase))
+                    return JsonSerializer.Deserialize<SessionBundle>(json);
+                // Legacy: single SessionRecord — wrap it in a bundle.
+                var rec = JsonSerializer.Deserialize<SessionRecord>(json);
+                if (rec == null) return null;
+                if (rec.TabId == null) rec.TabId = "t1";
+                return new SessionBundle { Tabs = new List<SessionRecord> { rec }, ActiveTabId = rec.TabId };
+            }
+            catch { return null; }
+        }
+
+        public static void SaveBundle(string cwd, SessionBundle bundle)
+        {
+            try
+            {
+                if (bundle == null) return;
+                Directory.CreateDirectory(Dir);
+                foreach (var rec in bundle.Tabs)
+                    if (rec.Messages != null && rec.Messages.Count > MaxMessages)
+                        rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
+                WriteEncrypted(FileFor(cwd), JsonSerializer.Serialize(bundle));
+            }
             catch { }
         }
 
@@ -89,16 +147,37 @@ namespace ClaudeCode.VisualStudio.Services
         {
             try
             {
-                var cipher = ProtectedData.Protect(Encoding.UTF8.GetBytes(json), null, DataProtectionScope.CurrentUser);
-                var buf = new byte[Magic.Length + cipher.Length];
-                Buffer.BlockCopy(Magic, 0, buf, 0, Magic.Length);
-                Buffer.BlockCopy(cipher, 0, buf, Magic.Length, cipher.Length);
-                File.WriteAllBytes(path, buf);
+                // CryptProtectData (DPAPI) can block indefinitely on corporate machines when the
+                // domain service is unreachable. Run it on a background thread with a timeout so
+                // the caller is never permanently stuck. Fall back to plaintext on timeout.
+                byte[] plain = Encoding.UTF8.GetBytes(json);
+                byte[] cipher = null;
+                try
+                {
+                    var t = System.Threading.Tasks.Task.Run(
+                        () => ProtectedData.Protect(plain, null, DataProtectionScope.CurrentUser));
+                    if (t.Wait(TimeSpan.FromSeconds(4)))
+                        cipher = t.Result;
+                }
+                catch { }
+
+                if (cipher != null)
+                {
+                    var buf = new byte[Magic.Length + cipher.Length];
+                    Buffer.BlockCopy(Magic, 0, buf, 0, Magic.Length);
+                    Buffer.BlockCopy(cipher, 0, buf, Magic.Length, cipher.Length);
+                    File.WriteAllBytes(path, buf);
+                }
+                else
+                {
+                    // DPAPI unavailable or timed out — fall back to plaintext.
+                    File.WriteAllText(path, json);
+                }
             }
             catch
             {
-                // DPAPI unavailable (rare) — fall back to plaintext so the conversation still persists.
-                File.WriteAllText(path, json);
+                // Last-resort plaintext so the conversation still persists.
+                try { File.WriteAllText(path, json); } catch { }
             }
         }
 

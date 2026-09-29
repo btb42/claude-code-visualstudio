@@ -10,11 +10,23 @@
       .replace(/'/g, "&#39;");
   }
 
+  // True when a backtick span looks like a file path that could be opened in the editor.
+  // Requires a path separator and a file extension in the last component; strips optional :line suffix.
+  function looksLikePath(s) {
+    if (!s || s.length > 300) return false;
+    if (/^https?:\/\//i.test(s)) return false;
+    var p = s.replace(/:\d+$/, '');
+    if (!/[\/\\]/.test(p)) return false;
+    var last = p.split(/[\/\\]/).pop();
+    return last ? /\.[a-z0-9]{1,6}$/i.test(last) : false;
+  }
+
   function inline(s) {
     // inline code first, protect from other rules
     const codes = [];
     s = s.replace(/`([^`]+)`/g, function (_, c) {
-      codes.push("<code>" + esc(c) + "</code>");
+      var cls = looksLikePath(c) ? ' class="fp"' : '';
+      codes.push('<code' + cls + '>' + esc(c) + '</code>');
       return "\u0000" + (codes.length - 1) + "\u0000";
     });
     s = esc(s);
@@ -22,7 +34,7 @@
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, text, url) {
       if (!/^(https?:|mailto:)/i.test(url)) return text;
       var safe = url.replace(/"/g, "%22");
-      return '<a href="' + safe + '" target="_blank" rel="noreferrer noopener">' + text + "</a>";
+      return '<a href="' + safe + '" target="_blank" rel="noreferrer noopener">' + text + '</a>';
     });
     // bold then italic
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -90,7 +102,7 @@
       if (/^(\*\*\*|---|___)\s*$/.test(line)) { closeList(); html += "<hr />"; i++; continue; }
 
       // blockquote
-      if (/^>\s?/.test(line)) { closeList(); html += "<blockquote>" + inline(line.replace(/^>\s?/, "")) + "</blockquote>"; i++; continue; }
+      if (/^>\s?/.test(line)) { closeList(); html += '<blockquote>' + inline(line.replace(/^>\s?/, '')) + '</blockquote>'; i++; continue; }
 
       // unordered list
       const ul = line.match(/^[-*+]\s+(.*)$/);
@@ -108,7 +120,7 @@
       // table: header row followed by separator row (|---|---|)
       if (/\|/.test(line) && i + 1 < lines.length && /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[i + 1])) {
         closeList();
-        var parseRow = function (r) { return r.replace(/^\||\|$/g, "").split("|").map(function (c) { return c.trim(); }); };
+        var parseRow = function (r) { return r.replace(/^\||\|$/g, '').split('|').map(function (c) { return c.trim(); }); };
         var heads = parseRow(line);
         var aligns = parseRow(lines[i + 1]).map(function (c) {
           if (/^:-+:$/.test(c)) return "center";

@@ -14,10 +14,12 @@ namespace ClaudeCode.VisualStudio
 {
     /// <summary>
     /// The Claude Code chat tool window. Hosts the WebView2 chat surface.
+    /// Multi-instance: each call to ShowAsync(id) opens a new tab with its own session.
     /// </summary>
     public class ClaudeChatToolWindow : BaseToolWindow<ClaudeChatToolWindow>
     {
-        public override string GetTitle(int toolWindowId) => "Claude Code";
+        public override string GetTitle(int toolWindowId) =>
+            toolWindowId == 0 ? "Claude Code" : "Claude Code #" + (toolWindowId + 1);
 
         public override Type PaneType => typeof(Pane);
 
@@ -32,8 +34,6 @@ namespace ClaudeCode.VisualStudio
             public Pane()
             {
 #if VS2017 || VS2019
-                // CommentSparkle was added in the VS 2022 (17.x) image catalog; the VS 2017/2019
-                // catalogs only have Comment.
                 BitmapImageMoniker = KnownMonikers.Comment;
 #else
                 BitmapImageMoniker = KnownMonikers.CommentSparkle;

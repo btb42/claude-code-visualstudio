@@ -75,7 +75,7 @@ namespace ClaudeCode.VisualStudio.Services
             var full = new[] { "none", "low", "medium", "high", "extrahigh", "max", "ultracode" };
             return new List<CliModelInfo>
             {
-                new CliModelInfo { Id = "default",  Name = "Default (recommended)", Label = "Opus with 1M context", Desc = "Best for everyday, complex tasks", Wire = "opus[1m]", Ratio = RatioFor("opus"), Efforts = full, AutoMode = true },
+                new CliModelInfo { Id = "default",  Name = "Default (Sonnet)", Label = "Sonnet", Desc = "Efficient for routine tasks", Wire = "sonnet", Ratio = RatioFor("sonnet"), Efforts = new[] { "none", "low", "medium", "high", "extrahigh", "max" }, AutoMode = true },
                 new CliModelInfo { Id = "opus[1m]", Name = "Opus (1M context)",     Label = "Opus with 1M context", Desc = "Best for everyday, complex tasks", Wire = "opus[1m]", Ratio = RatioFor("opus"), Efforts = full, AutoMode = true },
                 new CliModelInfo { Id = "fable",    Name = "Fable",                 Label = "Fable",  Desc = "Most capable for your hardest and longest-running tasks", Wire = "fable", Ratio = RatioFor("fable"), Efforts = full, AutoMode = true },
                 new CliModelInfo { Id = "sonnet",   Name = "Sonnet",                Label = "Sonnet", Desc = "Efficient for routine tasks", Wire = "sonnet", Ratio = RatioFor("sonnet"), Efforts = new[] { "none", "low", "medium", "high", "extrahigh", "max" }, AutoMode = true },
@@ -149,7 +149,44 @@ namespace ClaudeCode.VisualStudio.Services
                 var m = FromCliRow(row);
                 if (m != null && seen.Add(m.Id)) list.Add(m);
             }
+            AlignDefaultToSonnet(list);
             return list;
+        }
+
+        /// <summary>
+        /// The extension launches the picker's "default" entry as Sonnet
+        /// (<see cref="ClaudeSession"/>'s DefaultModel), regardless of what the CLI's own default
+        /// resolves to (currently Opus). Make the default row describe Sonnet too, so the label,
+        /// cost badge, and effort range shown match the model that actually runs. Copies from the
+        /// Sonnet row when the CLI lists one, else falls back to plain Sonnet values.
+        /// </summary>
+        private static void AlignDefaultToSonnet(List<CliModelInfo> list)
+        {
+            CliModelInfo def = null, sonnet = null;
+            foreach (var m in list)
+            {
+                if (m == null) continue;
+                if (m.Id == "default") def = m;
+                else if (sonnet == null && FamilyOf(m.Wire ?? m.Id) == "sonnet") sonnet = m;
+            }
+            if (def == null) return;
+
+            if (sonnet != null)
+            {
+                def.Label = sonnet.Label;
+                def.Desc = sonnet.Desc;
+                def.Wire = sonnet.Wire;
+                def.Ratio = sonnet.Ratio;
+                def.Efforts = sonnet.Efforts;
+                def.AutoMode = sonnet.AutoMode;
+            }
+            else
+            {
+                def.Label = "Sonnet";
+                def.Desc = "Efficient for routine tasks";
+                def.Wire = "sonnet";
+                def.Ratio = RatioFor("sonnet");
+            }
         }
 
         /// <summary>

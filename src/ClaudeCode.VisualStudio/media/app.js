@@ -15,12 +15,116 @@
 
   let running = false, currentAssistant = null, currentTurn = null, currentThinking = null;
   const toolCards = new Map();
+
+  // ── Tab management ─────────────────────────────────────────────────────────
+  const tabs = new Map();   // tabId → { id, title, el, running, currentTurn, currentAssistant, currentThinking, toolCards }
+  let activeTabId = null;
+
+  function msgRoot() {
+    const t = tabs.get(activeTabId);
+    return t ? t.el : els.messages;
+  }
+
+  function isActiveTab(p) { return !p || !p.tabId || p.tabId === activeTabId; }
+
+  function createTab(id, title) {
+    const el = document.createElement("div");
+    el.className = "tab-pane";
+    el.id = "tab-pane-" + id;
+    els.messages.appendChild(el);
+    const tab = { id: id, title: title, el: el, running: false, currentTurn: null, currentAssistant: null, currentThinking: null, toolCards: new Map(), ctx: { used: 0, window: 200000, windowReported: false, model: "", baseline: 0, system: 0, live: false }, totals: { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 }, usageText: "", compactPin: 0, cur: { model: "default", mode: "default", effort: "none" }, modelReconciled: false };
+    tabs.set(id, tab);
+    return tab;
+  }
+
+  function switchToTabId(newId) {
+    if (newId === activeTabId && tabs.has(newId)) return;
+    const old = tabs.get(activeTabId);
+    const nw = tabs.get(newId);
+    if (!nw) return;
+    diag("switchToTabId: " + (activeTabId || "null") + " -> " + newId + " nw.el.children=" + nw.el.childElementCount);
+    // Save active-tab state into the old tab object.
+    if (old) {
+      old.running = running; old.currentTurn = currentTurn;
+      old.currentAssistant = currentAssistant; old.currentThinking = currentThinking;
+      old.toolCards = new Map(toolCards);
+      old.ctx = Object.assign({}, ctx); old.totals = Object.assign({}, totals);
+      old.usageText = els.usage.textContent; old.compactPin = compactPin;
+      old.cur = Object.assign({}, cur);
+      old.el.style.display = "none";
+    }
+    activeTabId = newId;
+    running = nw.running; currentTurn = nw.currentTurn;
+    currentAssistant = nw.currentAssistant; currentThinking = nw.currentThinking;
+    toolCards.clear(); nw.toolCards.forEach(function(v, k) { toolCards.set(k, v); });
+    Object.assign(ctx, nw.ctx); Object.assign(totals, nw.totals);
+    els.usage.textContent = nw.usageText || ""; compactPin = nw.compactPin || 0;
+    Object.assign(cur, nw.cur || { model: "default", mode: "default", effort: "none" });
+    syncUI();
+    nw.el.style.display = "";
+    els.sendBtn.classList.toggle("hidden", running);
+    els.stopBtn.classList.toggle("hidden", !running);
+    if (!running) removeThinking();
+    renderTabBar();
+    restoreScroll("tab-switch");
+  }
+
+  function renderTabBar() {
+    const bar = document.getElementById("tab-bar");
+    if (!bar) return;
+    let html = "";
+    const canClose = tabs.size > 1;
+    tabs.forEach(function(tab) {
+      const active = tab.id === activeTabId;
+      const ri = tab.running ? '<span class="tab-run">●</span>' : "";
+      const closeBtn = canClose ? '<span class="tab-close" data-close="' + tab.id + '">×</span>' : "";
+      html += '<button class="tab-btn' + (active ? " active" : "") + '" data-tab="' + tab.id + '">'
+        + '<span class="tab-icon">✳</span>'
+        + '<span class="tab-title">' + window.md.esc(tab.title) + "</span>" + ri
+        + closeBtn
+        + '</button>';
+    });
+    html += '<button class="tab-new" title="New conversation">+</button>';
+    bar.innerHTML = html;
+    bar.querySelectorAll(".tab-btn[data-tab]").forEach(function(btn) {
+      btn.addEventListener("click", function(e) {
+        if (e.target.classList.contains("tab-close") || e.target.dataset.close) return;
+        post("switchTab", { tabId: btn.dataset.tab });
+      });
+      btn.addEventListener("mouseup", function(e) {
+        if (e.button === 1) { e.preventDefault(); post("closeTab", { tabId: btn.dataset.tab }); }
+      });
+    });
+    bar.querySelectorAll(".tab-close[data-close]").forEach(function(btn) {
+      btn.addEventListener("click", function(e) {
+        e.stopPropagation();
+        post("closeTab", { tabId: btn.dataset.close });
+      });
+    });
+    const nb = bar.querySelector(".tab-new");
+    if (nb) nb.addEventListener("click", function() { post("newTab", { defaultModel: getDefaultModel() }); });
+  }
+  // ── end tab management ──────────────────────────────────────────────────────
+
   let attachments = [];
   let slashCommands = [];
   let commandsLoading = false;
   let fileList = [], atQuery = "", atItems = [], atIndex = 0;
   let models = [], modes = [], efforts = [], effortsByModel = {};
+  let modelsFromCli = false;
   let cur = { model: "default", mode: "default", effort: "none" };
+
+  // ── Default model preference (persisted in localStorage) ───────────────────
+  const PREF_KEY = "claudeDefaultModel";
+  function getDefaultModel() { try { return localStorage.getItem(PREF_KEY) || "default"; } catch { return "default"; } }
+  function setDefaultModel(id) { try { localStorage.setItem(PREF_KEY, id); } catch {} }
+  function isDefaultModel(id) { return id === getDefaultModel(); }
+
+  // ── Default mode preference (persisted in localStorage) ────────────────────
+  const MODE_PREF_KEY = "claudeDefaultMode";
+  function getDefaultMode() { try { return localStorage.getItem(MODE_PREF_KEY) || "default"; } catch { return "default"; } }
+  function setDefaultMode(id) { try { localStorage.setItem(MODE_PREF_KEY, id); } catch {} }
+  function isDefaultMode(id) { return id === getDefaultMode(); }
   const totals = { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 };
   // `live` = ctx.used came from per-request usage (contextUsage) rather than the cumulative
   // turn totals in `result`, which overcount and must not win once real numbers are in.
@@ -109,6 +213,9 @@
          " top=" + els.messages.scrollTop + " max=" + maxTop());
     // Nothing that moves while we are hidden is the user scrolling.
     if (hidden) { ignoreScrollUntil = Infinity; return; }
+    // If the session was streaming while we were hidden, new content arrived at the bottom.
+    // Re-pin to bottom so the user sees the latest output, not a stale mid-scroll position.
+    if (running) stickBottom = true;
     restoreScroll("show");
     // An update that completed behind another tab gets its read-time now that it is on screen.
     if (updatedTo) scheduleUpdatedDismiss();
@@ -134,11 +241,11 @@
   function addMsg(role) {
     const w = document.createElement("div"); w.className = "msg " + role;
     const b = document.createElement("div"); b.className = "bubble";
-    w.appendChild(b); els.messages.appendChild(w); scrollDown(); return b;
+    w.appendChild(b); msgRoot().appendChild(w); scrollDown(); return b;
   }
   // ---- activity timeline (VS Code-style rail with dots) ----
   function ensureTurn() {
-    if (!currentTurn) { currentTurn = document.createElement("div"); currentTurn.className = "turn"; els.messages.appendChild(currentTurn); }
+    if (!currentTurn) { currentTurn = document.createElement("div"); currentTurn.className = "turn"; msgRoot().appendChild(currentTurn); }
     return currentTurn;
   }
   function endTurn() { currentTurn = null; currentAssistant = null; currentThinking = null; }
@@ -150,7 +257,7 @@
     node.appendChild(dot); node.appendChild(main); turn.appendChild(node); scrollDown();
     return { node: node, dot: dot, main: main };
   }
-  function removeThinking() { const t = els.messages.querySelector(".thinking-node"); if (t) t.remove(); }
+  function removeThinking() { const t = msgRoot().querySelector(".thinking-node"); if (t) t.remove(); }
   function showThinking(label) {
     removeThinking();
     const n = addNode("thinking-node", "spin");
@@ -332,7 +439,7 @@
   }
   // The card was answered for us (switching to Auto mode allows whatever is still pending).
   function resolvePermById(id, behavior, note) {
-    document.querySelectorAll(".perm").forEach((c) => { if (c.dataset.id === id) markPermResolved(c, behavior, note); });
+    msgRoot().querySelectorAll(".perm").forEach((c) => { if (c.dataset.id === id) markPermResolved(c, behavior, note); });
   }
 
   const handlers = {
@@ -342,14 +449,13 @@
       if (p.modes) modes = p.modes;
       if (p.efforts) efforts = p.efforts;
       if (p.effortsByModel) effortsByModel = p.effortsByModel;
-      if (p.model) cur.model = p.model;
-      if (p.permissionMode) cur.mode = p.permissionMode;
-      if (p.effort) cur.effort = p.effort;
+      // Only accept model/mode/effort from init when cur is still at the factory default.
+      // A restore or explicit user pick has already locked the value — init must not overwrite it.
+      if (p.model && cur.model === "default") cur.model = p.model;
+      if (p.permissionMode && cur.mode === "default") cur.mode = p.permissionMode;
+      if (p.effort && cur.effort === "none") cur.effort = p.effort;
       if (typeof p.showThinking === "boolean") thinkingVisible = p.showThinking;
-      reconcileModelId();
-      applyEffortsForModel();
-      updateModeLabel();
-      updateModelBtn();
+      syncUI();
       applyThinkingVisibility();
     },
     commands: (p) => { slashCommands = p.commands || []; commandsLoading = false; if (cOpen === "slash") { const q = els.cpop.querySelector("#palq"); filterPalette(q ? q.value : ""); } },
@@ -358,11 +464,9 @@
     // names, the canonical id each row resolves to, and per-model effort ranges. Replaces the
     // fallback rows init carried, so a new model release renames — or adds — a row on its own.
     models: (p) => {
-      if (Array.isArray(p.models) && p.models.length) models = p.models;
+      if (Array.isArray(p.models) && p.models.length) { models = p.models; modelsFromCli = true; }
       if (p.effortsByModel) effortsByModel = p.effortsByModel;
-      reconcileModelId();
-      applyEffortsForModel();
-      updateModelBtn();
+      syncUI();
       if (topOpen === "model") renderModel();
       if (topOpen === "context") renderContext();
     },
@@ -404,39 +508,46 @@
     context: (p) => mergeContextIde(p),
     theme: (p) => applyTheme(p),
     status: (p) => {
+      const forActive = isActiveTab(p);
+      if (!forActive) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) { bgTab.running = (p.state === "thinking" || p.state === "running"); renderTabBar(); }
+        return;
+      }
       running = p.state === "thinking" || p.state === "running";
+      const aTab = tabs.get(activeTabId); if (aTab) aTab.running = running;
       els.statusText.textContent = p.text || cap(p.state || "Ready");
       els.sendBtn.classList.toggle("hidden", running);
       els.stopBtn.classList.toggle("hidden", !running);
       if (!running) removeThinking();
+      renderTabBar();
     },
-    assistantStart: () => { removeThinking(); settleThinking(); currentAssistant = null; },
+    assistantStart: (p) => { if (!isActiveTab(p)) return; removeThinking(); settleThinking(); currentAssistant = null; },
     assistantDelta: (p) => {
+      if (!isActiveTab(p)) return;
       if (!currentAssistant) { settleThinking(); const n = addNode("text-node", "text"); currentAssistant = { el: n.main, buf: "" }; }
       currentAssistant.buf += p.text || ""; currentAssistant.el.innerHTML = window.md.render(currentAssistant.buf); scrollDown();
     },
-    assistantEnd: () => { settleThinking(); currentAssistant = null; },
-    assistant: (p) => { removeThinking(); settleThinking(); const n = addNode("text-node", "text"); renderBlocks(n.main, p.content || []); currentAssistant = null; scrollDown(); },
-    thinking: (p) => showThinking(p.label),
-    thinkingDelta: (p) => appendThinking(p.text),
-    toolUse: (p) => { removeThinking(); renderToolUse(p); },
-    toolResult: (p) => renderToolResult(p),
-    permission: (p) => { removeThinking(); renderPermission(p); },
-    permissionResolved: (p) => resolvePermById(p.id, p.behavior, "(Auto mode)"),
+    assistantEnd: (p) => { if (!isActiveTab(p)) return; settleThinking(); currentAssistant = null; },
+    assistant: (p) => { if (!isActiveTab(p)) return; removeThinking(); settleThinking(); const n = addNode("text-node", "text"); renderBlocks(n.main, p.content || []); currentAssistant = null; scrollDown(); },
+    thinking: (p) => { if (!isActiveTab(p)) return; showThinking(p.label); },
+    thinkingDelta: (p) => { if (!isActiveTab(p)) return; appendThinking(p.text); },
+    toolUse: (p) => { if (!isActiveTab(p)) return; removeThinking(); renderToolUse(p); },
+    toolResult: (p) => { if (!isActiveTab(p)) return; renderToolResult(p); },
+    permission: (p) => { if (!isActiveTab(p)) return; removeThinking(); renderPermission(p); },
+    permissionResolved: (p) => { if (!isActiveTab(p)) return; resolvePermById(p.id, p.behavior, "(Auto mode)"); },
     // Live context size, one per API request. Authoritative for the ring — see the `result` handler.
     contextUsage: (p) => {
+      if (!isActiveTab(p)) return;
       ctx.used = +(p.totalTokens || p.promptTokens || 0);
       ctx.live = true;
-      // The cached prefix (system prompt + tools + skills) is written cold on the session's first
-      // request — that write IS the prefix size. Only take the baseline from such a request: on a
-      // resumed session the first request we see reads the whole restored conversation back from
-      // cache, and counting that as "system" would swallow every message into the wrong bucket.
       if (!ctx.baseline && !(+(p.cacheReadTokens || 0))) ctx.baseline = +(p.cacheCreationTokens || 0);
       ctx.system = Math.min(ctx.baseline || 0, ctx.used);
       updateRing();
       if (topOpen === "context") renderContext();
     },
     result: (p) => {
+      if (!isActiveTab(p)) return;
       const parts = [];
       if (p.costUsd != null) parts.push("$" + Number(p.costUsd).toFixed(4));
       if (p.inputTokens != null) parts.push(p.inputTokens + " in");
@@ -446,13 +557,6 @@
       totals.costUsd += +(p.costUsd || 0); totals.inputTokens += +(p.inputTokens || 0);
       totals.outputTokens += +(p.outputTokens || 0); totals.turns += 1;
       totals.cacheReadTokens += +(p.cacheReadTokens || 0); totals.cacheCreationTokens += +(p.cacheCreationTokens || 0);
-      // context window usage. A /compact turn ends with a result whose usage still describes the
-      // PRE-compaction context, and it arrives after compact_boundary — so honour the post-compact
-      // figure the CLI already gave us for this one turn instead of letting it be clobbered.
-      //
-      // Otherwise the ring is driven by `contextUsage` (per-request), NOT by these totals: this
-      // event's usage is summed over every API request of the turn, so a turn with tool round-trips
-      // counts the cached prefix once per request and races past 100% of the window.
       if (compactPin) { ctx.used = compactPin; ctx.live = false; compactPin = 0; }
       else if (!ctx.live) ctx.used = (+(p.inputTokens || 0)) + (+(p.cacheReadTokens || 0)) + (+(p.cacheCreationTokens || 0));
       if (p.contextWindow) { ctx.window = +p.contextWindow; ctx.windowReported = true; }
@@ -463,38 +567,75 @@
       if (topOpen === "context") renderContext();
     },
     error: (p) => {
+      if (!isActiveTab(p)) return;
       removeThinking();
       const msg = p.message || "Error";
       const low = msg.toLowerCase();
       let extra = "";
-      // The host now says whether the CLI actually blamed authentication. Fall back to sniffing
-      // the text only for messages that predate the flag — guessing from "exited (code" is what
-      // sent people to fix a login that was never broken.
       const wantsLogin = typeof p.login === "boolean" ? p.login
         : /log ?in|logged in|auth|credential|unauthor|could not launch/.test(low);
       if (wantsLogin)
         extra = '<div class="err-actions"><button class="sb-btn" data-act="login">Sign in</button></div>';
+      else if (p.retry)
+        extra = '<div class="err-actions"><button class="sb-btn" data-act="retry">Retry</button></div>';
       else if (/credit|billing|subscription|quota|insufficient|payment|plan/.test(low))
         extra = '<div class="err-note">Claude Code needs a paid Pro/Max plan or API credits — a free account can\'t run it.</div>';
       const b = addMsg("assistant");
       b.innerHTML = '<span style="color:var(--red)">⚠ ' + window.md.esc(msg) + "</span>" + extra;
       const lb = b.querySelector('[data-act="login"]');
       if (lb) lb.addEventListener("click", () => { authFlow = { state: "starting" }; post("startLogin"); renderSetupBanner(lastSetup || {}); });
-      post("recheckSetup"); // refresh the onboarding banner after a failure
+      const rb = b.querySelector('[data-act="retry"]');
+      if (rb) rb.addEventListener("click", () => { post("newSession"); });
+      post("recheckSetup");
     },
-    system: (p) => { if (p.subtype === "init" && p.model) { ctx.model = p.model; updateModelBtn(); } },
-    clear: () => { els.messages.innerHTML = ""; els.usage.textContent = ""; endTurn(); toolCards.clear(); },
+    system: (p) => { if (!isActiveTab(p)) return; if (p.subtype === "init" && p.model) { ctx.model = p.model; updateModelBtn(); } },
+    clear: (p) => {
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) { bgTab.el.innerHTML = ""; bgTab.currentTurn = null; bgTab.currentAssistant = null; bgTab.currentThinking = null; bgTab.toolCards.clear(); bgTab.running = false; bgTab.ctx = { used: 0, window: 200000, windowReported: false, model: "", baseline: 0, system: 0, live: false }; bgTab.totals = { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 }; bgTab.usageText = ""; bgTab.compactPin = 0; }
+        return;
+      }
+      const root = msgRoot(); if (root) root.innerHTML = ""; else els.messages.innerHTML = "";
+      els.usage.textContent = ""; endTurn(); toolCards.clear();
+    },
     restore: (p) => {
-      endTurn(); els.messages.innerHTML = ""; toolCards.clear();
-      if (p.model) { cur.model = p.model; reconcileModelId(); }
-      if (p.mode) { cur.mode = p.mode; updateModeLabel(); }
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) {
+          bgTab.el.innerHTML = ""; bgTab.currentTurn = null; bgTab.currentAssistant = null;
+          bgTab.currentThinking = null; bgTab.toolCards.clear();
+          if (!bgTab.cur) bgTab.cur = { model: "default", mode: "default", effort: "none" };
+          if (p.model) bgTab.cur.model = p.model;
+          if (p.mode) bgTab.cur.mode = p.mode;
+          if (p.effort) bgTab.cur.effort = p.effort;
+          bgTab.modelReconciled = false;
+          const msgs = p.messages || [];
+          if (msgs.length) {
+            const d = document.createElement("div"); d.className = "compacted-divider";
+            d.innerHTML = "<span>Restored previous conversation</span>"; bgTab.el.appendChild(d);
+          }
+          msgs.forEach((m) => {
+            const w = document.createElement("div"); w.className = "msg " + (m.role === "user" ? "user" : "assistant");
+            const b = document.createElement("div"); b.className = "bubble";
+            b.innerHTML = window.md.render(m.text || ""); w.appendChild(b); bgTab.el.appendChild(w);
+          });
+        }
+        return;
+      }
+      endTurn();
+      const root = msgRoot() || els.messages;
+      root.innerHTML = ""; toolCards.clear();
+      if (p.model) cur.model = p.model;
+      if (p.mode) cur.mode = p.mode;
       if (p.effort) cur.effort = p.effort;
       if (typeof p.showThinking === "boolean") { thinkingVisible = p.showThinking; applyThinkingVisibility(); }
-      applyEffortsForModel();
-      // The restored selection labels the button, not whatever model a previous session resolved to.
+      // Restored model id may be an alias that needs remap once CLI list arrives.
+      const activeTab = tabs.get(activeTabId);
+      if (activeTab) { activeTab.modelReconciled = false; activeTab.cur = Object.assign({}, cur); }
+      syncUI();
       ctx.model = ""; updateModelBtn();
       const msgs = p.messages || [];
-      if (msgs.length) { const d = document.createElement("div"); d.className = "compacted-divider"; d.innerHTML = "<span>Restored previous conversation</span>"; els.messages.appendChild(d); }
+      if (msgs.length) { const d = document.createElement("div"); d.className = "compacted-divider"; d.innerHTML = "<span>Restored previous conversation</span>"; root.appendChild(d); }
       msgs.forEach((m) => {
         endTurn();
         if (m.role === "user") { addMsg("user").innerHTML = window.md.render(m.text || ""); }
@@ -502,13 +643,34 @@
       });
       endTurn(); scrollDown();
     },
+    tabCreated: (p) => {
+      if (!p || !p.tabId) return;
+      const tab = createTab(p.tabId, p.title || "Chat");
+      // New tabs inherit the stored default model (unless the host already resolved one).
+      const dm = p.model || getDefaultModel();
+      tab.cur = { model: dm, mode: p.mode || getDefaultMode(), effort: "none" };
+      if (p.active) { activeTabId = p.tabId; }
+      else { tab.el.style.display = "none"; }
+      diag("tabCreated: " + p.tabId + " active=" + !!p.active + " activeTabId=" + activeTabId + " tabs=" + tabs.size);
+      renderTabBar();
+    },
+    tabSwitched: (p) => { if (p && p.tabId) switchToTabId(p.tabId); },
+    tabClosed: (p) => {
+      if (!p || !p.tabId) return;
+      const tab = tabs.get(p.tabId);
+      if (tab) { tab.el.remove(); tabs.delete(p.tabId); }
+      renderTabBar();
+    },
+    updateTabTitle: (p) => {
+      if (!p || !p.tabId) return;
+      const tab = tabs.get(p.tabId);
+      if (tab && p.title) { tab.title = p.title; renderTabBar(); }
+    },
     accountData: (p) => { acct = p; if (topOpen === "usage") renderUsage(); },
     mcpList: (p) => { lastMcp = p.servers || []; lastMcpError = p.error || null; if (topOpen === "mcp") renderMcp(); else if (topOpen === "context") renderContext(); },
-    // The CLI compacted its context in place (system/compact_boundary). It emits no assistant
-    // text, so all the transcript needs is a divider — with the real before/after token counts
-    // from compact_metadata rather than a guess. "auto" means the window filled and the CLI
-    // compacted on its own, which is worth labelling differently from a deliberate /compact.
+    sessionDiag: (p) => { lastDiag = p; if (topOpen === "context") renderContext(); },
     compacted: (p) => {
+      if (!isActiveTab(p)) return;
       removeThinking(); endTurn();
       const n = document.createElement("div");
       n.className = "compacted-divider";
@@ -516,7 +678,7 @@
       let label = p.trigger === "auto" ? "Auto-compacted" : "Compacted";
       if (pre && post) label += " · " + fmt(pre) + " → " + fmt(post) + " tokens";
       n.innerHTML = "<span>" + window.md.esc(label) + "</span>";
-      els.messages.appendChild(n);
+      msgRoot().appendChild(n);
       // Re-baseline the ring off what the CLI reports it actually kept, instead of zeroing and
       // waiting for the next turn's result to correct it.
       ctx.used = post || 0; ctx.baseline = 0; ctx.system = 0; ctx.live = false;
@@ -526,7 +688,7 @@
     },
     attachImage: (p) => { attachments.push({ mediaType: p.mediaType, data: p.data, name: p.name }); renderAttachments(); },
     insertText: (p) => { els.input.value += (els.input.value && !els.input.value.endsWith(" ") ? " " : "") + (p.text || ""); els.input.focus(); autoGrow(); },
-    sentSelection: (p) => attachSelectionChip(p),
+    sentSelection: (p) => { if (!isActiveTab(p)) return; attachSelectionChip(p); },
     debugBreak: (p) => renderDebugBreak(p),
   };
 
@@ -545,14 +707,14 @@
     div.className = "debug-break" + (isExc ? " exc" : "");
     div.innerHTML = '<div class="db-head">' + window.md.esc(head) + '</div>'
       + (where ? '<div class="db-where">' + window.md.esc(where) + '</div>' : "")
-      + '<div class="db-actions"><button class="db-btn" data-act="explain">Ask Claude about this</button></div>';
+      + '<div class="db-actions"><button class="db-btn" data-act="explain">Ask Claude</button></div>';
     div.querySelector('[data-act="explain"]').addEventListener("click", () => {
       const q = isExc
         ? "The debugger stopped on an exception. Explain what caused it and how to fix it."
         : "The debugger is paused here. Explain the current state and what the code is doing.";
       els.input.value = q; els.input.focus(); autoGrow();
     });
-    els.messages.appendChild(div); scrollDown();
+    msgRoot().appendChild(div); scrollDown();
   }
   function fileName(p) { return p ? String(p).split(/[\\/]/).pop() : ""; }
 
@@ -560,7 +722,7 @@
   // selection the host captured and sent as context, click to open the file at that line.
   function attachSelectionChip(p) {
     if (!p || !p.filePath) return;
-    const bubbles = els.messages.querySelectorAll(".msg.user .bubble");
+    const bubbles = msgRoot().querySelectorAll(".msg.user .bubble");
     const b = bubbles[bubbles.length - 1];
     if (!b) return;
     const name = String(p.filePath).split(/[\\/]/).pop() || p.filePath;
@@ -578,7 +740,12 @@
   function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
   function fmt(n) { n = +n || 0; if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"; if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"; return String(n); }
   function modeName(id) { const m = modes.find((x) => x.id === id); return m ? m.name : id; }
-  function updateModeLabel() { els.modeLabel.textContent = modeName(cur.mode).replace(/ mode$/i, "").replace("Edit automatically", "Auto-edit").replace("Ask before edits", "Ask"); }
+  function updateModeLabel() {
+    // If cur.mode is not in visibleModes (e.g. bypassPermissions on haiku), display the
+    // effective mode ("default") without changing cur.mode — it will restore when model changes.
+    const effective = (modes.length && !visibleModes().some((m) => m.id === cur.mode)) ? "default" : cur.mode;
+    els.modeLabel.textContent = modeName(effective).replace(/ mode$/i, "").replace("Edit automatically", "Auto-edit").replace("Ask before edits", "Ask");
+  }
   // The model picker is labelled with the model itself — "Opus 5 (1M)" — the way the VS Code panel
   // labels it, so what is answering is visible without opening the picker. Prefer the id the CLI
   // reported the alias resolved to: that IS the model that ran the last turn. Before a session has
@@ -593,10 +760,18 @@
   }
   function updateModelBtn() {
     const row = models.find((m) => m.id === cur.model);
-    const name = shortModel(ctx.model ? modelDisplay(ctx.model)
-      : (row ? (row.label || row.name) : modelDisplay(cur.model)));
+    const name = shortModel(row ? (row.label || row.name) : modelDisplay(cur.model));
     els.modelBtn.textContent = (name || "Model") + " ▾";
-    els.modelBtn.title = "Model: " + (ctx.model || wireOf(cur.model)) + " — click to change model & effort";
+    els.modelBtn.title = "Model: " + wireOf(cur.model) + " — click to change model & effort";
+  }
+  // Redraw all UI controls to match cur/ctx without touching cur. Call this whenever the
+  // display needs refreshing after cur has already been set to the right value.
+  function syncUI() {
+    reconcileModelId();
+    applyEffortsForModel();
+    updateModeLabel();
+    updateModelBtn();
+    updateRing();
   }
   function applyThinkingVisibility() {
     els.messages.classList.toggle("hide-thinking", !thinkingVisible);
@@ -608,24 +783,22 @@
   // Object.prototype members ("constructor", "hasOwnProperty", …) to inherited functions.
   function own(o, k) { return o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined; }
   function applyEffortsForModel() {
-    // Custom model ids have no per-model entry; assume the full (default/Opus) range.
+    // Clamp cur.effort to what's valid for cur.model. Only corrects genuinely invalid values.
     const list = own(effortsByModel, cur.model) || own(effortsByModel, "default") || efforts;
     if (list && list.length) efforts = list;
-    if (!efforts.some((e) => e.id === cur.effort)) {
+    if (efforts.length && !efforts.some((e) => e.id === cur.effort)) {
       cur.effort = (efforts[0] || { id: "none" }).id;
       post("setEffort", { effort: cur.effort });
     }
-    if (!visibleModes().some((m) => m.id === cur.mode)) {
-      cur.mode = "default";
-      post("setPermissionMode", { mode: cur.mode });
-      updateModeLabel();
-    }
+    // cur.mode is intentionally NOT clamped here. If the current model doesn't support the
+    // saved mode (e.g. bypassPermissions on haiku), updateModeLabel shows "default" visually
+    // but the stored value is preserved — so switching back to a capable model restores it.
   }
   // Maps a fallback picker id to the wire name handed to the CLI, also shown in the "Switched to"
   // divider. All aliases, never dated ids — the CLI resolves each to the newest model in that
   // family at launch. Mirrors ClaudeSession.DefaultModel. Only a fallback: once the host relays
   // the CLI's own list, each row carries the canonical id it resolves to (`wire`), and that wins.
-  const MODEL_WIRE = { default: "opus[1m]", fable: "fable", sonnet: "sonnet", haiku: "haiku" };
+  const MODEL_WIRE = { default: "sonnet", fable: "fable", sonnet: "sonnet", haiku: "haiku" };
   function wireOf(id) { const row = models.find((m) => m.id === id); return (row && row.wire) || own(MODEL_WIRE, id) || id; }
   function is1m(s) { return /\[1m\]/i.test(String(s || "")); }
   // The persisted selection can predate the CLI list: a fallback alias ("fable") where the CLI
@@ -634,7 +807,15 @@
   // gating apply — the model that runs is the same either way. A versioned id with no row is a
   // deliberate pin and stays as typed; so does an alias the fallback never offered ("opus").
   function reconcileModelId() {
-    if (!cur.model || models.some((m) => m.id === cur.model)) return;
+    // Alias→versioned remap runs once after the CLI list arrives, then never again for this tab.
+    // Repeated calls (syncUI on every result) must not touch cur.model.
+    if (!modelsFromCli) return;
+    const tab = tabs.get(activeTabId);
+    if (tab && tab.modelReconciled) return;
+    if (!cur.model || models.some((m) => m.id === cur.model)) {
+      if (tab) tab.modelReconciled = true;
+      return;
+    }
     const lc = String(cur.model).toLowerCase();
     let row = models.find((m) => m.id !== "default" && String(m.wire || "").toLowerCase() === lc)
       || models.find((m) => String(m.wire || "").toLowerCase() === lc);
@@ -643,6 +824,7 @@
       const same = models.filter((m) => m.id !== "default" && fam(m.wire || m.id) === fam(cur.model));
       row = same.find((m) => is1m(m.id) === is1m(cur.model)) || (same.length === 1 ? same[0] : null);
     }
+    if (tab) tab.modelReconciled = true;
     if (!row) return;
     cur.model = row.id;
     post("setModel", { model: cur.model });
@@ -677,7 +859,7 @@
     const d = document.createElement("div");
     d.className = "compacted-divider";
     d.innerHTML = "<span>Switched to " + window.md.esc(wireOf(id)) + "</span>";
-    els.messages.appendChild(d); scrollDown();
+    msgRoot().appendChild(d); scrollDown();
   }
   function effortDesc(id) {
     switch (id) {
@@ -709,7 +891,7 @@
   // Picking a different model changes the window (1M Opus -> 200k Sonnet), but the CLI only says
   // so on the next `result`. Drop the reported value so ctxWindow() follows the new selection
   // right away instead of measuring against the old model's window for one turn.
-  function onModelSwitched() { ctx.windowReported = false; ctx.model = ""; updateModelBtn(); updateRing(); if (topOpen === "context") renderContext(); }
+  function onModelSwitched() { ctx.windowReported = false; ctx.model = ""; updateModelBtn(); updateRing(); if (topOpen === "context") renderContext(); const at = tabs.get(activeTabId); if (at) { at.cur = Object.assign({}, cur); at.modelReconciled = true; } }
   function updateRing() {
     const win = ctxWindow();
     const C = 94.2; const frac = win ? Math.min(1, ctx.used / win) : 0;
@@ -833,12 +1015,30 @@
     copyText(code.textContent || "").then((ok) => flashCopy(btn, ok));
   });
 
+  // ---- inline file-path chips (class="fp") ----
+  // Backtick code spans that look like file paths get class="fp" from markdown.js. Clicking them
+  // sends openFile so VS can open the file in the editor. Parses an optional :line suffix.
+  els.messages.addEventListener("click", (e) => {
+    const chip = e.target.closest && e.target.closest("code.fp");
+    if (!chip) return;
+    e.preventDefault(); e.stopPropagation();
+    let path = (chip.textContent || "").trim();
+    let line;
+    const m = path.match(/^(.+):(\d+)$/);
+    if (m) { path = m[1]; line = parseInt(m[2], 10); }
+    const msg = { path };
+    if (line > 0) msg.line = line;
+    post("openFile", msg);
+  });
+
   function copyText(text) {
     // The panel is served from https://claudecode.local, a secure origin, so the async clipboard
     // API is available here. The execCommand path stays as a fallback anyway: a copy button that
     // silently does nothing is worse than no button at all.
+    const active = document.activeElement;
+    const restore = () => { try { if (active && active.focus) active.focus(); } catch (_) {} };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
+      return navigator.clipboard.writeText(text).then(() => { restore(); return true; }, () => legacyCopy(text));
     }
     return Promise.resolve(legacyCopy(text));
   }
@@ -884,6 +1084,21 @@
     if (cOpen && !els.cpop.contains(e.target) && !e.target.closest("#plusBtn,#slashBtn,#modeBtn,#input")) closeC();
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAll(); });
+  // If focus drifted to the document body (e.g. after an async clipboard write), redirect
+  // printable keystrokes and Space back into the input so typing continues uninterrupted.
+  document.addEventListener("keydown", (e) => {
+    if (e.target !== document.body && e.target !== document.documentElement) return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.key.length === 1 || e.key === "Backspace" || e.key === "Delete") {
+      els.input.focus();
+    }
+  });
+  // KEY DIAGNOSTIC: log every keydown so we can identify what combination steals focus.
+  // Remove once the offending shortcut is found.
+  document.addEventListener("keydown", (e) => {
+    const mod = (e.ctrlKey ? "Ctrl+" : "") + (e.altKey ? "Alt+" : "") + (e.shiftKey ? "Shift+" : "") + (e.metaKey ? "Win+" : "");
+    diag("KEY: " + mod + e.key + " code=" + e.code + " focus=" + (document.activeElement && document.activeElement.id || document.activeElement && document.activeElement.tagName));
+  }, true);
 
   // ---- top popovers ----
   function resetTotals() {
@@ -892,7 +1107,7 @@
   }
   function activeTop() { [["model", els.modelBtn], ["context", els.contextBtn], ["usage", els.usageBtn]].forEach(([k, b]) => b.classList.toggle("active", topOpen === k)); }
   function closeTop() { topOpen = null; els.popover.classList.add("hidden"); els.popover.innerHTML = ""; activeTop(); }
-  function openTop(which) { closeC(); topOpen = which; activeTop(); if (which === "model") renderModel(); else if (which === "context") { post("getContext"); if (!(lastIde && (lastIde.mcpServers || []).length) && lastMcp == null) post("getMcp"); renderContext(); } else if (which === "usage") { post("getUsage"); renderUsage(); } else if (which === "mcp") { lastMcp = null; post("getMcp"); renderMcp(); } }
+  function openTop(which) { closeC(); topOpen = which; activeTop(); if (which === "model") renderModel(); else if (which === "context") { post("getContext"); post("getSessionDiag"); if (!(lastIde && (lastIde.mcpServers || []).length) && lastMcp == null) post("getMcp"); renderContext(); } else if (which === "usage") { post("getUsage"); renderUsage(); } else if (which === "mcp") { lastMcp = null; post("getMcp"); renderMcp(); } }
   function toggleTop(w) { if (topOpen === w) closeTop(); else openTop(w); }
   function showTop(html) { els.popover.innerHTML = html; els.popover.classList.remove("hidden"); const x = els.popover.querySelector(".close-x"); if (x) x.addEventListener("click", closeTop); }
 
@@ -926,13 +1141,17 @@
 
   function renderModel() {
     let h = '<h3>Select a model <button class="close-x">×</button></h3>';
+    const dflt = getDefaultModel();
     models.forEach((m) => {
       // Row reads "<model> · <what it is for>", matching the VS Code panel. The model half is the
       // CLI-resolved id when we know it (the selected row, after a session has started), else the
       // host's fallback label.
       const label = (m.id === cur.model && ctx.model ? prettyModel(ctx.model) : "") || m.label || "";
       const line = label ? (m.desc ? label + " · " + m.desc : label) : (m.desc || "");
-      h += '<div class="opt' + (m.id === cur.model ? " sel" : "") + '" data-id="' + m.id + '"><div class="obody"><div class="oname">' + window.md.esc(m.name) + '</div><div class="odesc">' + window.md.esc(line) + '</div></div>' + ratioBadge(m.ratio) + (m.id === cur.model ? '<div class="ochk">✓</div>' : "") + "</div>";
+      const isDefault = m.id === dflt;
+      const starTitle = isDefault ? "Default for new tabs" : "Set as default for new tabs";
+      const starCls = "model-star" + (isDefault ? " model-star-on" : "");
+      h += '<div class="opt' + (m.id === cur.model ? " sel" : "") + '" data-id="' + m.id + '"><div class="obody"><div class="oname">' + window.md.esc(m.name) + '</div><div class="odesc">' + window.md.esc(line) + '</div></div>' + ratioBadge(m.ratio) + '<button class="' + starCls + '" data-star="' + window.md.esc(m.id) + '" title="' + starTitle + '" aria-label="' + starTitle + '">★</button>' + (m.id === cur.model ? '<div class="ochk">✓</div>' : "") + "</div>";
     });
     const isCustom = !!cur.model && !models.some((m) => m.id === cur.model);
     // A selected custom id reads the same way as the built-in rows: friendly name, then the id.
@@ -944,15 +1163,21 @@
     const curName = (efforts[ei] || {}).name || "Off";
     h += '<div class="effort-row"><div class="elabel">' + DUMBBELL + ' Effort <small id="effdesc">(' + window.md.esc(curName + " — " + effortDesc(cur.effort)) + ')</small></div><input type="range" class="effort-slider" id="effslider" min="0" max="' + (efforts.length - 1) + '" value="' + ei + '" /></div>';
     showTop(h);
-    els.popover.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", () => {
+    els.popover.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", (e) => {
+      if (e.target.classList.contains("model-star") || e.target.closest(".model-star")) return;
       if (o.dataset.id === "__custom") { renderCustomModel(); return; }
       if (o.dataset.id !== cur.model) { cur.model = o.dataset.id; post("setModel", { model: cur.model }); applyEffortsForModel(); showModelDivider(cur.model); onModelSwitched(); }
       closeTop();
     }));
+    els.popover.querySelectorAll(".model-star").forEach((btn) => btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setDefaultModel(btn.dataset.star);
+      renderModel();
+    }));
     const sl = els.popover.querySelector("#effslider");
     if (sl) sl.addEventListener("input", () => {
       const e = efforts[+sl.value] || efforts[0];
-      cur.effort = e.id; post("setEffort", { effort: cur.effort });
+      cur.effort = e.id; post("setEffort", { effort: cur.effort }); const at2 = tabs.get(activeTabId); if (at2) at2.cur = Object.assign({}, cur);
       const dd = els.popover.querySelector("#effdesc");
       if (dd) dd.textContent = "(" + e.name + " — " + effortDesc(e.id) + ")";
     });
@@ -1022,6 +1247,7 @@
       h += kv("Email", acct.email || "—");
       h += kv("Organization", acct.organization || "—");
       h += kv("Plan", acct.plan || "—");
+      if (acct.extensionBuild) h += kv("Extension build", "build " + acct.extensionBuild);
 
       if (acct.limits && acct.limits.length > 0) {
         h += '<div class="sec">Usage</div>';
@@ -1104,6 +1330,7 @@
   // /mcp screen: configured MCP servers with live health (from `claude mcp list`),
   // grouped by scope (Project / User / claude.ai), with refresh + per-server hints/actions.
   let lastMcp = null, lastMcpError = null;
+  let lastDiag = null;
   const MCP_GROUP_ORDER = ["Project", "User", "claude.ai"];
   function renderMcp() {
     let h = '<h3>MCP servers <button class="close-x">×</button><button class="mcp-refresh" title="Re-check">↻</button></h3>';
@@ -1213,7 +1440,46 @@
       h += '<div class="sec">Open files (' + f.length + ")</div>";
       h += f.length ? '<ul class="files">' + f.map((x) => "<li>" + window.md.esc(x) + "</li>").join("") + "</ul>" : '<div style="color:var(--fg-dim)">none</div>';
     }
+    h += '<div class="sec">Session</div>';
+    if (!lastDiag) {
+      h += '<div style="color:var(--fg-dim)">loading…</div>';
+    } else {
+      const d = lastDiag;
+      const proxyStatus = d.proxyOk === true ? '✓' : d.proxyOk === false ? '✗' : '—';
+      const proxyColor = d.proxyOk === true ? 'var(--green,#6abf6a)' : d.proxyOk === false ? 'var(--red,#e06c6c)' : '';
+      h += kv("Tab", window.md.esc(d.tabId || "—") + (d.tabCount > 1 ? " (of " + d.tabCount + ")" : ""));
+      h += kv("Session ID", d.sessionId ? window.md.esc(d.sessionId.substring(0, 8) + "…") : "none");
+      h += kv("Running", d.isRunning ? "yes" : "no");
+      h += kv("Mode", window.md.esc(d.permissionMode || "—"));
+      h += kv("CLI", window.md.esc(d.cliVersion || "—"));
+      if (d.extensionBuild) h += kv("Extension", "build " + d.extensionBuild);
+      h += '<div class="kv"><span class="k">Proxy</span><span class="v">' + window.md.esc(d.proxyUrl || "—") + (d.proxyOk !== undefined && d.proxyOk !== null ? ' <span style="color:' + proxyColor + '">' + proxyStatus + '</span>' : '') + '</span></div>';
+      h += '<div class="diag-actions">';
+      h += '<button class="diag-btn" data-a="restartTab">↺ Restart this tab</button>';
+      if (d.tabCount > 1) h += '<button class="diag-btn diag-btn-sec" data-a="restartAllTabs">↺ Restart all tabs (' + d.tabCount + ')</button>';
+      h += '</div>';
+      if (d.log) {
+        h += '<div class="sec" style="margin-top:8px">Recent log <button class="diag-copy" data-log="1">Copy</button></div>';
+        h += '<pre class="diag-log">' + window.md.esc(d.log) + '</pre>';
+      }
+    }
     showTop(h);
+    // wire up restart + copy buttons
+    if (lastDiag) {
+      els.popover.querySelectorAll(".diag-btn[data-a]").forEach(function(b) {
+        b.addEventListener("click", function() {
+          lastDiag = null;
+          post(b.dataset.a);
+          renderContext();
+        });
+      });
+      var copyBtn = els.popover.querySelector(".diag-copy[data-log]");
+      if (copyBtn && lastDiag.log) {
+        copyBtn.addEventListener("click", function() {
+          navigator.clipboard.writeText(lastDiag.log).catch(function() {});
+        });
+      }
+    }
   }
   function row(c, name, tk, win) { const pc = win ? (tk / win * 100) : 0; return '<div class="sw" style="background:' + c + (c === "transparent" ? ";border:1px solid var(--border)" : "") + '"></div><div class="nm">' + window.md.esc(name) + '</div><div class="tk">' + fmt(tk) + '</div><div class="pc">' + (pc < 0.1 && pc > 0 ? "<0.1" : pc.toFixed(1)) + "%</div>"; }
   function kv(k, v) { return '<div class="kv"><span class="k">' + window.md.esc(k) + '</span><span class="v">' + window.md.esc(v == null || v === "" ? "—" : String(v)) + "</span></div>"; }
@@ -1250,11 +1516,19 @@
   function renderMode() {
     let h = '<div class="sec">Permission mode</div>';
     visibleModes().forEach((m) => {
-      h += '<div class="opt' + (m.id === cur.mode ? " sel" : "") + '" data-id="' + m.id + '"><div class="oicon">' + (m.icon || "") + '</div><div class="obody"><div class="oname">' + window.md.esc(m.name) + '</div><div class="odesc">' + window.md.esc(m.desc || "") + '</div></div>' + (m.id === cur.mode ? '<div class="ochk">✓</div>' : "") + "</div>";
+      const isDflt = isDefaultMode(m.id);
+      const starTitle = isDflt ? "Default for new tabs" : "Set as default for new tabs";
+      h += '<div class="opt' + (m.id === cur.mode ? " sel" : "") + '" data-id="' + m.id + '"><div class="oicon">' + (m.icon || "") + '</div><div class="obody"><div class="oname">' + window.md.esc(m.name) + '</div><div class="odesc">' + window.md.esc(m.desc || "") + '</div></div>' + (m.id === cur.mode ? '<div class="ochk">✓</div>' : "") + '<button class="mode-star' + (isDflt ? " starred" : "") + '" data-star="' + m.id + '" title="' + starTitle + '">★</button></div>';
     });
     h += '<div class="effort-row"><div class="elabel">Show thinking <small>(stream reasoning)</small></div><button class="mini-toggle' + (thinkingVisible ? " on" : "") + '" id="thinkToggle">' + (thinkingVisible ? "On" : "Off") + '</button></div>';
     showC(h);
-    els.cpop.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", () => { cur.mode = o.dataset.id; post("setPermissionMode", { mode: cur.mode }); updateModeLabel(); closeC(); }));
+    els.cpop.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", (e) => {
+      if (e.target.classList.contains("mode-star") || e.target.dataset.star) return;
+      cur.mode = o.dataset.id; post("setPermissionMode", { mode: cur.mode }); updateModeLabel(); closeC(); const at3 = tabs.get(activeTabId); if (at3) at3.cur = Object.assign({}, cur);
+    }));
+    els.cpop.querySelectorAll(".mode-star[data-star]").forEach((btn) => btn.addEventListener("click", (e) => {
+      e.stopPropagation(); setDefaultMode(btn.dataset.star); renderMode();
+    }));
     const tt = els.cpop.querySelector("#thinkToggle");
     if (tt) tt.addEventListener("click", () => { thinkingVisible = !thinkingVisible; post("setShowThinking", { on: thinkingVisible }); applyThinkingVisibility(); renderMode(); });
   }

@@ -62,6 +62,7 @@
     <Reference Include="WindowsFormsIntegration" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="BuildInfo.g.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <!-- Body is #if VS2017 || VS2019 only; compiles to nothing in this (VS2022/2026) project. -->
     <Compile Include="AssemblyResolver.cs" />
@@ -79,6 +80,7 @@
     <Compile Include="Services\ClaudeCliLocator.cs" />
     <Compile Include="Services\ClaudeMessages.cs" />
     <Compile Include="Services\ClaudeSession.cs" />
+    <Compile Include="Services\ProcessJob.cs" />
     <Compile Include="Services\IdeContextService.cs" />
     <Compile Include="Services\DebugContextService.cs" />
     <Compile Include="Services\ThemeService.cs" />
@@ -149,5 +151,27 @@
   <Target Name="CopyVsixToDist" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' And Exists('$(TargetVsixContainer)')">
     <Copy SourceFiles="$(TargetVsixContainer)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\dist" SkipUnchangedFiles="false" />
     <Message Importance="high" Text="Copied VSIX -&gt; $(MSBuildProjectDirectory)\..\..\dist\$([System.IO.Path]::GetFileName($(TargetVsixContainer)))" />
+  </Target>
+
+  <!-- Auto-increment build number on every build. Reads build-number.txt, increments, writes back,
+       and regenerates BuildInfo.g.cs so the counter is embedded in the binary. -->
+  <PropertyGroup>
+    <BuildNumberFile>$(MSBuildProjectDirectory)\build-number.txt</BuildNumberFile>
+    <BuildInfoFile>$(MSBuildProjectDirectory)\BuildInfo.g.cs</BuildInfoFile>
+  </PropertyGroup>
+  <Target Name="IncrementBuildNumber" BeforeTargets="CoreCompile">
+    <ReadLinesFromFile File="$(BuildNumberFile)" Condition="Exists('$(BuildNumberFile)')">
+      <Output TaskParameter="Lines" ItemName="_BNLines" />
+    </ReadLinesFromFile>
+    <PropertyGroup>
+      <_CurrentBN>@(_BNLines->'%(Identity)', '')</_CurrentBN>
+      <_CurrentBN Condition="'$(_CurrentBN)' == ''">0</_CurrentBN>
+      <_NextBN>$([MSBuild]::Add($(_CurrentBN), 1))</_NextBN>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(BuildNumberFile)" Lines="$(_NextBN)" Overwrite="true" />
+    <WriteLinesToFile File="$(BuildInfoFile)"
+      Lines="// &lt;auto-generated/&gt;%0Ainternal static class BuildInfo { public const string Build = &quot;$(_NextBN)&quot;%3B }"
+      Overwrite="true" />
+    <Message Importance="high" Text="Build number: $(_NextBN)" />
   </Target>
 </Project>

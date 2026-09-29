@@ -16,7 +16,7 @@ namespace ClaudeCode.VisualStudio.Services
     public sealed class ClaudeSessionOptions
     {
         public string WorkingDirectory;
-        public string Model;                 // null/"default" -> DefaultModel (latest Opus, 1M ctx)
+        public string Model;                 // null/"default" -> DefaultModel (Sonnet)
         public string PermissionMode = "acceptEdits";
         public string Effort;                // none|low|medium|high -> --max-thinking-tokens
         public string ResumeSessionId;       // for continuing a prior session
@@ -51,7 +51,7 @@ namespace ClaudeCode.VisualStudio.Services
         // in app.js. Deliberately an *alias*, not a pinned/dated id: the CLI resolves "opus" to
         // the newest Opus at launch time, so a new model release is picked up without shipping a
         // new extension build. The "[1m]" suffix keeps the 1M-context variant.
-        private const string DefaultModel = "opus[1m]";
+        private const string DefaultModel = "sonnet";
 
         private bool PermissionPromptEnabled =>
             string.Equals(_options.PermissionMode, "default", StringComparison.Ordinal);
@@ -181,6 +181,9 @@ namespace ClaudeCode.VisualStudio.Services
             {
                 _process.Start();
                 Log.Write("Process.Start OK pid=" + _process.Id);
+                // Tie the child to a kill-on-close job so it can never outlive VS and leave an
+                // orphan holding the --resume session lock (see ProcessJob).
+                ProcessJob.Assign(_process);
             }
             catch (Exception ex)
             {
@@ -196,8 +199,9 @@ namespace ClaudeCode.VisualStudio.Services
                 NewLine = "\n",
             };
 
-            _ = Task.Run(() => ReadLoopAsync(_process.StandardOutput));
-            _ = Task.Run(() => ErrorLoopAsync(_process.StandardError));
+            var pid = _process.Id.ToString(CultureInfo.InvariantCulture);
+            StartIoThread(() => ReadLoopAsync(_process.StandardOutput), "claude-out-" + pid);
+            StartIoThread(() => ErrorLoopAsync(_process.StandardError), "claude-err-" + pid);
 
             _liveMode = _options.PermissionMode;
             PermissionPromptRegistered = PermissionPromptEnabled;
@@ -458,6 +462,27 @@ namespace ClaudeCode.VisualStudio.Services
         }
 
         // ---- Reading -----------------------------------------------------
+        // Starts the read/error loop on a dedicated OS thread rather than a ThreadPool task.
+        // When the ThreadPool is saturated at VS startup, a Task.Run-queued loop may not start
+        // for several seconds. Meanwhile the CLI writes its MCP handshake + system/init to stdout.
+        // If that data exceeds the pipe buffer before anyone reads it, the CLI blocks on a write —
+        // deadlock. A dedicated Thread starts and calls ReadLineAsync immediately, registering
+        // the I/O with the OS so data is consumed as it arrives (via IOCP) regardless of
+        // ThreadPool load.
+        private static void StartIoThread(Func<Task> loop, string name)
+        {
+            var t = new System.Threading.Thread(
+#pragma warning disable VSTHRD002 // GetResult is safe here: this is a dedicated background thread, not the VS main/UI thread
+                () => loop().GetAwaiter().GetResult()
+#pragma warning restore VSTHRD002
+            )
+            {
+                IsBackground = true,
+                Name = name,
+            };
+            t.Start();
+        }
+
         private async Task ReadLoopAsync(StreamReader reader)
         {
             try
@@ -487,7 +512,7 @@ namespace ClaudeCode.VisualStudio.Services
                 {
                     if (line.Length > 0)
                     {
-                        Log.WriteVerbose("ERR " + line);
+                        Log.Write("ERR " + line);
                         Diagnostic?.Invoke("stderr: " + line);
                         LastError = line;
                         // The CLI's wording for an id it cannot find. Matched loosely so a
@@ -735,14 +760,26 @@ namespace ClaudeCode.VisualStudio.Services
                 info.CacheReadTokens = GetLong(usage, "cache_read_input_tokens");
                 info.CacheCreationTokens = GetLong(usage, "cache_creation_input_tokens");
             }
-            // modelUsage is keyed by model id; pull the context window + model name from it.
+            // modelUsage is keyed by model id and lists EVERY model the CLI touched this turn —
+            // the main answering model plus the small fast model (Haiku) it uses internally for
+            // side tasks (title generation, quick classification...). Key order is not guaranteed,
+            // so taking the first entry would sometimes surface Haiku as "the model" and make the
+            // picker flicker. Pick the entry that did the real work: most output tokens first
+            // (Haiku writes very few tokens for its side tasks), falling back to most input+output.
             if (root.TryGetProperty("modelUsage", out var mu) && mu.ValueKind == JsonValueKind.Object)
             {
+                long bestOutput = -1, bestTotal = -1;
                 foreach (var prop in mu.EnumerateObject())
                 {
-                    info.Model = prop.Name;
-                    info.ContextWindow = GetLong(prop.Value, "contextWindow");
-                    break;
+                    long output = GetLong(prop.Value, "output_tokens");
+                    long total = GetLong(prop.Value, "input_tokens") + output;
+                    bool better = output > bestOutput || (output == bestOutput && total > bestTotal);
+                    if (better)
+                    {
+                        bestOutput = output; bestTotal = total;
+                        info.Model = prop.Name;
+                        info.ContextWindow = GetLong(prop.Value, "context_window");
+                    }
                 }
             }
             if (!string.IsNullOrEmpty(info.SessionId)) SessionId = info.SessionId;

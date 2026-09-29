@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -42,15 +43,101 @@ namespace ClaudeCode.VisualStudio.Services
     public static class AccountService
     {
         private static readonly HttpClient _http;
+        private static readonly string _baseUrl;
 
         static AccountService()
         {
+            _baseUrl = ResolveBaseUrl();
             _http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             // The "claude-code/" User-Agent prefix is REQUIRED by the OAuth usage endpoint;
             // without it the request lands in an aggressively rate-limited bucket (persistent 429s).
             _http.DefaultRequestHeaders.Add("User-Agent", "claude-code/1.0.0");
             _http.DefaultRequestHeaders.Add("anthropic-beta", "oauth-2025-04-20");
             _http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+        }
+
+        private static string ResolveBaseUrl()
+        {
+            // 1. Explicit env var override (e.g. set by developer or CI)
+            var fromEnv = Environment.GetEnvironmentVariable("ANTHROPIC_BASE_URL");
+            if (!string.IsNullOrEmpty(fromEnv))
+                return fromEnv.TrimEnd('/');
+
+            // 2. Read from ~/.claude/settings.json — same source the claude CLI uses
+            try
+            {
+                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var settingsPath = Path.Combine(home, ".claude", "settings.json");
+                if (File.Exists(settingsPath))
+                {
+                    using (var doc = JsonDocument.Parse(File.ReadAllText(settingsPath)))
+                    {
+                        if (doc.RootElement.TryGetProperty("env", out var env) &&
+                            env.TryGetProperty("ANTHROPIC_BASE_URL", out var url) &&
+                            url.ValueKind == JsonValueKind.String)
+                        {
+                            var val = url.GetString();
+                            if (!string.IsNullOrEmpty(val))
+                            {
+                                Log.Write("AccountService: baseUrl from settings.json: " + val);
+                                return val.TrimEnd('/');
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write("AccountService: failed to read settings.json: " + ex.Message); }
+
+            // 3. Default — direct Anthropic API
+            return "https://api.anthropic.com";
+        }
+
+        internal sealed class AuthStatus
+        {
+            public bool LoggedIn;
+            public string Email;
+            public string Plan;
+            public string AuthMethod;
+        }
+
+        // `claude auth status --json` is the CLI's own verdict. Covers cases where no
+        // credentials file exists on disk (e.g. corporate proxy using ANTHROPIC_AUTH_TOKEN).
+        internal static AuthStatus GetAuthStatus()
+        {
+            try
+            {
+                var cli = ClaudeCliLocator.Locate();
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = cli.FileName,
+                    Arguments = cli.ArgumentPrefix + "auth status --json",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    if (p == null) return null;
+                    string outp = p.StandardOutput.ReadToEnd();
+                    if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return null; }
+
+                    int i = (outp ?? string.Empty).IndexOf('{');
+                    if (i < 0) return null;
+                    using (var doc = JsonDocument.Parse(outp.Substring(i)))
+                    {
+                        var r = doc.RootElement;
+                        return new AuthStatus
+                        {
+                            LoggedIn = r.TryGetProperty("loggedIn", out var li) && li.ValueKind == JsonValueKind.True,
+                            Email = r.TryGetProperty("email", out var em) && em.ValueKind == JsonValueKind.String ? em.GetString() : null,
+                            Plan = r.TryGetProperty("subscriptionType", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null,
+                            AuthMethod = r.TryGetProperty("authMethod", out var am) && am.ValueKind == JsonValueKind.String ? am.GetString() : null,
+                        };
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write("GetAuthStatus: " + ex.Message); return null; }
         }
 
         public static async Task<AccountData> FetchAsync()
@@ -61,6 +148,16 @@ namespace ClaudeCode.VisualStudio.Services
                 var token = ReadToken(out var authMethod);
                 if (token == null)
                 {
+                    // No credential file — check if the CLI is authenticated via a corporate proxy
+                    // (ANTHROPIC_AUTH_TOKEN in settings.json). That token is for the local proxy, not
+                    // for api.anthropic.com, so we cannot fetch profile / limits, but the user IS
+                    // logged in. Return a result with no error so the Usage panel doesn't mislead them.
+                    var authStatus = GetAuthStatus();
+                    if (authStatus != null && authStatus.LoggedIn)
+                    {
+                        result.AuthMethod = authStatus.AuthMethod ?? "Corporate proxy";
+                        return result;  // no error, no profile/limits (proxy users don't have them here)
+                    }
                     var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                     result.Error = "Not logged in (credentials not found — checked " + home + @"\.claude\.credentials.json and AppData\Claude)";
                     return result;
@@ -70,7 +167,7 @@ namespace ClaudeCode.VisualStudio.Services
                 // Account profile (email + organization). OAuth token works against
                 // api.anthropic.com — NOT claude.ai/api, which sits behind a Cloudflare
                 // bot challenge and returns 403 "Just a moment..." for programmatic calls.
-                using (var req = AuthRequest(HttpMethod.Get, "https://api.anthropic.com/api/oauth/profile", token))
+                using (var req = AuthRequest(HttpMethod.Get, _baseUrl + "/api/oauth/profile", token))
                 {
                     var resp = await _http.SendAsync(req);
                     var body = await resp.Content.ReadAsStringAsync();
@@ -80,7 +177,7 @@ namespace ClaudeCode.VisualStudio.Services
                 }
 
                 // Usage / rate-limit windows (5-hour session, 7-day weekly, per-model weekly).
-                using (var req = AuthRequest(HttpMethod.Get, "https://api.anthropic.com/api/oauth/usage", token))
+                using (var req = AuthRequest(HttpMethod.Get, _baseUrl + "/api/oauth/usage", token))
                 {
                     var resp = await _http.SendAsync(req);
                     var body = await resp.Content.ReadAsStringAsync();

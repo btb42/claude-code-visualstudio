@@ -1,9 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using ClaudeCode.VisualStudio.Services;
 using ClaudeCode.VisualStudio.WebView;
 using Community.VisualStudio.Toolkit;
@@ -22,28 +24,54 @@ namespace ClaudeCode.VisualStudio
         private readonly WebView2 _webView;
         private readonly WebViewHost _host;
 
-        private ClaudeSession _session;
-        private string _model = "default";
-        private string _permissionMode = "default";   // safest default: ask before edits
-        private string _effort = "none";
-        private bool _showThinking = true;
+        // ── Per-tab state ────────────────────────────────────────────────────────────
+        private sealed class TabState
+        {
+            public readonly string TabId;
+            public string Title;           // user-visible tab label; set from first message
+            public string Model = "default";
+            public string PermissionMode = "default";
+            public string Effort = "none";
+            public bool ShowThinking = true;
+            public ClaudeSession Session;
+            public SessionRecord Record;
+            public string LastSentText;
+            public IReadOnlyList<ImageInput> LastSentImages;
+            public bool ResumeRetried;
+            public string PendingResumeId;
+            public bool Compacting;
+            public bool OptionsDirty;
+            public readonly Dictionary<string, EditSnapshot> EditedFiles = new Dictionary<string, EditSnapshot>();
+            public TabState(string id) { TabId = id; }
+        }
+        private readonly Dictionary<string, TabState> _tabs = new Dictionary<string, TabState>();
+        private string _activeTabId;
+        private int _nextTabIndex;
 
-        private bool _optionsDirty;
-        private bool _compacting;
+        private TabState ActiveTab => _activeTabId != null && _tabs.TryGetValue(_activeTabId, out var _aTab) ? _aTab : null;
+        // Shim properties — forwards to the active tab so all existing code compiles unchanged.
+        private ClaudeSession _session { get => ActiveTab?.Session; set { if (ActiveTab != null) ActiveTab.Session = value; } }
+        private bool _optionsDirty { get => ActiveTab?.OptionsDirty == true; set { if (ActiveTab != null) ActiveTab.OptionsDirty = value; } }
+        private bool _compacting { get => ActiveTab?.Compacting == true; set { if (ActiveTab != null) ActiveTab.Compacting = value; } }
+        private SessionRecord _record { get => ActiveTab?.Record; set { if (ActiveTab != null) ActiveTab.Record = value; } }
+        private string _lastSentText { get => ActiveTab?.LastSentText; set { if (ActiveTab != null) ActiveTab.LastSentText = value; } }
+        private IReadOnlyList<ImageInput> _lastSentImages { get => ActiveTab?.LastSentImages; set { if (ActiveTab != null) ActiveTab.LastSentImages = value; } }
+        private bool _resumeRetried { get => ActiveTab?.ResumeRetried == true; set { if (ActiveTab != null) ActiveTab.ResumeRetried = value; } }
+        private string _pendingResumeId { get => ActiveTab?.PendingResumeId; set { if (ActiveTab != null) ActiveTab.PendingResumeId = value; } }
+        // ── end per-tab state ─────────────────────────────────────────────────────────
+
+        private string _model { get => ActiveTab?.Model ?? "default"; set { if (ActiveTab != null) ActiveTab.Model = value; } }
+        private string _permissionMode { get => ActiveTab?.PermissionMode ?? "default"; set { if (ActiveTab != null) ActiveTab.PermissionMode = value; } }
+        private string _effort { get => ActiveTab?.Effort ?? "none"; set { if (ActiveTab != null) ActiveTab.Effort = value; } }
+        private bool _showThinking { get => ActiveTab?.ShowThinking ?? true; set { if (ActiveTab != null) ActiveTab.ShowThinking = value; } }
 
         private readonly IdeContextService _ide = new IdeContextService();
         private readonly DebugContextService _debug = new DebugContextService();
         private readonly ThemeService _theme = new ThemeService();
-        private readonly Dictionary<string, EditSnapshot> _editedFiles = new Dictionary<string, EditSnapshot>();
 
         private sealed class EditSnapshot { public string Path; public string OldText; }
         private List<string> _tools = new List<string>();
         private List<string> _mcpServers = new List<string>();
-        private SessionRecord _record;        // persisted transcript for the current cwd
-        private string _lastSentText;         // last turn, replayed once if --resume is refused
-        private IReadOnlyList<ImageInput> _lastSentImages;
-        private bool _resumeRetried;          // one replay per turn, never a restart loop
-        private string _pendingResumeId;      // CLI session id to --resume on next start (restore)
         private bool _solutionHooked;         // subscribed to solution-load events (restore retry)
         private bool _updateWatchRunning;     // polling for a `claude update` to land
         private bool _updateRunning;          // a background `claude update` process is in flight
@@ -68,6 +96,33 @@ namespace ClaudeCode.VisualStudio
             _host.MessageReceived += OnMessageReceived;
             _theme.ThemeChanged += vars => _host.PostMessage("theme", vars);
 
+            // Create the initial tab before any message can arrive.
+            _nextTabIndex = 1;
+            _activeTabId = "t1";
+            _tabs["t1"] = new TabState("t1");
+
+            // KEY DIAGNOSTIC: log every keystroke that reaches WPF level (fires before WebView
+            // consumes it). Used to identify which key combination is stealing focus/switching tabs.
+            // Remove once the offending shortcut is identified.
+            PreviewKeyDown += (s, e) =>
+            {
+                var mod = new System.Text.StringBuilder();
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))  mod.Append("Ctrl+");
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt))      mod.Append("Alt+");
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))    mod.Append("Shift+");
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Windows))  mod.Append("Win+");
+                Log.Write("KEY: " + mod + e.Key + " (sys=" + e.SystemKey + ")");
+
+                // Space reaching WPF means the WebView dropped focus (e.g. after an async
+                // clipboard write). Re-focus the WebView so VS does not interpret it as a
+                // tool-window navigation command, then let the keystroke through — the
+                // document-level keydown handler in app.js will route it to #input.
+                if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    _webView.Focus();
+                }
+            };
+
             Loaded += OnLoaded;
             // Hiding the panel or switching away from its tab unloads the control, and showing it
             // again loads it back. OnLoaded unsubscribes itself (it is the one-time boot), so this
@@ -76,12 +131,13 @@ namespace ClaudeCode.VisualStudio
             Unloaded += (s, e) =>
             {
                 UnhookSolutionLoad();
-                // Clear the field, don't just dispose it: StartPeriodicCliCheck() treats a non-null
-                // timer as "already running", so leaving a disposed one behind killed the hourly
-                // check for the rest of the VS session the first time the panel was hidden.
                 var timer = System.Threading.Interlocked.Exchange(ref _cliCheckTimer, null);
                 timer?.Dispose();
-                _session?.Dispose();
+                // Sessions are intentionally NOT disposed here. Unloaded fires whenever the panel
+                // loses focus (user clicks Solution Explorer, switches tab, etc.) — that is a view
+                // change, not a session termination. Killing the CLI process here was the root cause
+                // of all "stops responding" issues: the CLI was killed every time the user looked away.
+                // Sessions are cleaned up when the user explicitly closes/resets them, or when VS exits.
             };
         }
 
@@ -209,6 +265,15 @@ namespace ClaudeCode.VisualStudio
                 case "newSession":
                     ResetSession();
                     break;
+                case "newTab":
+                    HandleNewTab(GetStr(message.Payload, "defaultModel"));
+                    break;
+                case "switchTab":
+                    HandleSwitchTab(GetStr(message.Payload, "tabId"));
+                    break;
+                case "closeTab":
+                    HandleCloseTab(GetStr(message.Payload, "tabId"));
+                    break;
                 case "setModel":
                     _model = InputValidation.SanitizeModel(GetStr(message.Payload, "model"), "default");
                     _optionsDirty = true;
@@ -279,6 +344,17 @@ namespace ClaudeCode.VisualStudio
                 case "pickImage":
                     PickImage();
                     break;
+                case "getSessionDiag":
+                    SendSessionDiag(ActiveTab);
+                    break;
+                case "restartTab":
+                    RestartTabSession(ActiveTab);
+                    SendSessionDiag(ActiveTab);
+                    break;
+                case "restartAllTabs":
+                    foreach (var rt in _tabs.Values) RestartTabSession(rt);
+                    SendSessionDiag(ActiveTab);
+                    break;
                 case "pickFile":
                     PickFile();
                     break;
@@ -306,7 +382,8 @@ namespace ClaudeCode.VisualStudio
         {
             string id = GetStr(payload, "id");
             if (string.IsNullOrEmpty(id)) return;
-            if (_editedFiles.TryGetValue(id, out var snap))
+            var ef = ActiveTab?.EditedFiles;
+            if (ef != null && ef.TryGetValue(id, out var snap))
                 ThreadHelper.JoinableTaskFactory.RunAsync(async () => await ShowEditAsync(snap)).FireAndForget();
         }
 
@@ -391,6 +468,7 @@ namespace ClaudeCode.VisualStudio
                     },
                     manageUrl = data.ManageUrl,
                     error = data.Error,
+                    extensionBuild = BuildInfo.Build,
                 });
             });
         }
@@ -482,6 +560,72 @@ namespace ClaudeCode.VisualStudio
                     _host.PostMessage("mcpList", new { servers = new List<object>(), error = ex.Message });
                 }
             });
+        }
+
+        private void RestartTabSession(TabState tab)
+        {
+            if (tab == null) return;
+            tab.Session?.Dispose();
+            tab.Session = null;
+            tab.PendingResumeId = null;
+            if (tab.Record != null) { tab.Record.SessionId = null; SaveAllTabs(); }
+            Log.Write("RestartTabSession: tab=" + tab.TabId);
+            _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
+        }
+
+        private void SendSessionDiag(TabState tab)
+        {
+            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
+            {
+                var proxyUrl = ReadProxyUrl();
+                bool? proxyOk = null;
+                if (!string.IsNullOrEmpty(proxyUrl))
+                {
+                    try
+                    {
+                        var uri = new Uri(proxyUrl);
+                        var port = uri.Port > 0 ? uri.Port : (uri.Scheme == "https" ? 443 : 80);
+                        using var tcp = new System.Net.Sockets.TcpClient();
+                        var ct = tcp.ConnectAsync(uri.Host, port);
+                        proxyOk = await System.Threading.Tasks.Task.WhenAny(ct, System.Threading.Tasks.Task.Delay(1500)) == ct && !ct.IsFaulted;
+                    }
+                    catch { proxyOk = false; }
+                }
+
+                // Read the last ~40 useful log lines, stripping scroll/resize/AccountService spam.
+                var logLines = new List<string>();
+                try
+                {
+                    var lines = System.IO.File.ReadAllLines(Log.Path);
+                    for (int li = lines.Length - 1; li >= 0 && logLines.Count < 40; li--)
+                    {
+                        var ln = lines[li];
+                        if (ln.Contains("restore(resize)") || ln.Contains("restore(tab-switch)") ||
+                            ln.Contains("restore(scroll") || ln.Contains("AccountService: no credentials") ||
+                            ln.Contains("web: "))
+                            continue;
+                        logLines.Insert(0, ln);
+                    }
+                }
+                catch { }
+
+                string cliVer = null;
+                try { cliVer = GetInstalledCliVersion(); } catch { }
+
+                _host.PostMessage("sessionDiag", new
+                {
+                    tabId = tab?.TabId ?? "—",
+                    sessionId = tab?.Session?.SessionId ?? tab?.Record?.SessionId,
+                    isRunning = tab?.Session?.IsRunning ?? false,
+                    permissionMode = _permissionMode,
+                    cliVersion = cliVer ?? "—",
+                    proxyUrl = proxyUrl ?? "—",
+                    proxyOk = proxyOk,
+                    tabCount = _tabs.Count,
+                    log = string.Join("\n", logLines),
+                    extensionBuild = BuildInfo.Build,
+                });
+            }).FireAndForget();
         }
 
         // How long to sit on the slash-command refresh when the cache already answered. Spawning
@@ -592,6 +736,19 @@ namespace ClaudeCode.VisualStudio
                     t = Perf.Now;
                     bool loggedIn = cliFound && AccountService.HasStoredToken();
                     Perf.Step("setup: HasStoredToken", t);
+
+                    // HasStoredToken only reads credential files on disk. Some platforms (Windows
+                    // native install) store the OAuth token outside those files — fall back to
+                    // `claude auth status --json` in that case. It is a ~1.5s process but runs on
+                    // a thread-pool thread here, so it never touches the UI.
+                    if (cliFound && !loggedIn)
+                    {
+                        t = Perf.Now;
+                        var authStatus = AccountService.GetAuthStatus();
+                        Perf.Step("setup: GetAuthStatus fallback", t);
+                        if (authStatus != null && authStatus.LoggedIn) loggedIn = true;
+                    }
+
                     // npm presence decides whether the banner offers a one-click "Install CLI"
                     // (runs npm in a visible terminal) or just a "get Node.js" link.
                     t = Perf.Now;
@@ -622,21 +779,6 @@ namespace ClaudeCode.VisualStudio
                         });
                         Perf.Mark("setup: version probe deferred " + versionDelayMs + "ms");
                         await System.Threading.Tasks.Task.Delay(versionDelayMs).ConfigureAwait(false);
-                    }
-
-                    if (cliFound && loggedIn)
-                    {
-                        // Confirm with the CLI now that we are off the load path. HasStoredToken
-                        // only proves somebody signed in once; the file outlives the token, so an
-                        // expired login otherwise reads as healthy right up until a turn fails.
-                        t = Perf.Now;
-                        var auth = GetAuthStatus();
-                        Perf.Step("setup: claude auth status (process)", t);
-                        if (auth != null && !auth.LoggedIn)
-                        {
-                            Log.Write("setup: credentials present but CLI reports signed out");
-                            loggedIn = false;
-                        }
                     }
 
                     if (cliFound && loggedIn)
@@ -1100,6 +1242,25 @@ namespace ClaudeCode.VisualStudio
             return s.Length <= max ? s : "…" + s.Substring(s.Length - max);
         }
 
+        private static string ReadProxyUrl()
+        {
+            try
+            {
+                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var path = System.IO.Path.Combine(home, ".claude", "settings.json");
+                if (!System.IO.File.Exists(path)) return null;
+                using (var doc = JsonDocument.Parse(System.IO.File.ReadAllText(path)))
+                {
+                    if (doc.RootElement.TryGetProperty("env", out var env) &&
+                        env.TryGetProperty("ANTHROPIC_BASE_URL", out var url) &&
+                        url.ValueKind == JsonValueKind.String)
+                        return url.GetString();
+                }
+            }
+            catch { }
+            return null;
+        }
+
         /// <summary>
         /// Notice when the update actually lands and refresh the banner by itself.
         /// <para>
@@ -1260,7 +1421,7 @@ namespace ClaudeCode.VisualStudio
 
                 // Ask the CLI what it thinks rather than inferring from an exit code - the same
                 // answer the rest of the extension now gates on.
-                var status = GetAuthStatus();
+                var status = AccountService.GetAuthStatus();
                 bool ok = status != null && status.LoggedIn;
                 Log.Write("login finished: loggedIn=" + ok);
                 _host.PostMessage("authFlow", new
@@ -1307,52 +1468,6 @@ namespace ClaudeCode.VisualStudio
             catch (Exception ex) { Log.Write("CancelInPanelLogin: " + ex.Message); }
         }
 
-        private sealed class AuthStatus
-        {
-            public bool LoggedIn;
-            public string Email;
-            public string Plan;
-        }
-
-        // `claude auth status --json` is the CLI's own verdict. A credentials file on disk only
-        // says somebody signed in once - it stays there when the token expires, which is exactly
-        // when the banner most needs to be right.
-        private static AuthStatus GetAuthStatus()
-        {
-            try
-            {
-                var cli = ClaudeCliLocator.Locate();
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = cli.FileName,
-                    Arguments = cli.ArgumentPrefix + "auth status --json",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                };
-                using (var p = System.Diagnostics.Process.Start(psi))
-                {
-                    if (p == null) return null;
-                    string outp = p.StandardOutput.ReadToEnd();
-                    if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return null; }
-
-                    int i = (outp ?? string.Empty).IndexOf('{');
-                    if (i < 0) return null;
-                    using (var doc = JsonDocument.Parse(outp.Substring(i)))
-                    {
-                        var r = doc.RootElement;
-                        return new AuthStatus
-                        {
-                            LoggedIn = r.TryGetProperty("loggedIn", out var li) && li.ValueKind == JsonValueKind.True,
-                            Email = r.TryGetProperty("email", out var em) && em.ValueKind == JsonValueKind.String ? em.GetString() : null,
-                            Plan = r.TryGetProperty("subscriptionType", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null,
-                        };
-                    }
-                }
-            }
-            catch (Exception ex) { Log.Write("GetAuthStatus: " + ex.Message); return null; }
-        }
 
         // The picker rows and their effort ranges. Replaces the fallback rows the init message
         // carried with the list the CLI reported (`source` is "cache" or "cli", for the log).
@@ -1395,6 +1510,10 @@ namespace ClaudeCode.VisualStudio
                 },
                 effortsByModel = CliModelList.EffortsByModel(fallback),
             });
+            // Tell the page about the initial tab before anything else is rendered.
+            // Pass the saved model so the tab doesn't fall back to localStorage's last-used value
+            // from a different workspace.
+            _host.PostMessage("tabCreated", new { tabId = _activeTabId, title = "Chat 1", active = true, model = _model });
 
             ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
@@ -1429,37 +1548,88 @@ namespace ClaudeCode.VisualStudio
         }
 
         /// <summary>
-        /// Load this working directory's persisted transcript and push it to the UI. No-op once a
-        /// record is in hand or a live session owns the transcript, so it is safe to call again
-        /// when the working directory is re-resolved.
+        /// Load all persisted tabs for this working directory and push them to the UI.
+        /// No-op once any tab already has a record or live session.
         /// </summary>
         private void TryRestoreForCwd()
         {
-            if (_record != null || _session != null) return;
+            // If any tab already has data, we've already restored (or a session is live).
+            if (_tabs.Values.Any(t => t.Record != null || t.Session != null)) return;
 
-            var rec = SessionStore.Load(_cwd);
-            if (rec == null)
+            var bundle = SessionStore.LoadBundle(_cwd);
+            if (bundle == null || bundle.Tabs == null || bundle.Tabs.Count == 0)
             {
-                Log.Write("restore: no stored session for cwd=" + _cwd);
+                Log.Write("restore: no stored bundle for cwd=" + _cwd);
                 return;
             }
 
-            bool hasMsgs = rec.Messages != null && rec.Messages.Count > 0;
-            _record = rec;
-            if (hasMsgs && !string.IsNullOrEmpty(rec.SessionId)) _pendingResumeId = rec.SessionId;
-            _model = InputValidation.SanitizeModel(rec.Model, "default");
-            _permissionMode = InputValidation.SanitizeChoice(rec.Mode, InputValidation.AllowedModes, "default");
-            _effort = InputValidation.SanitizeChoice(rec.Effort, InputValidation.AllowedEfforts, "none");
-            _showThinking = rec.ShowThinking;
-            Log.Write("restore: " + (hasMsgs ? rec.Messages.Count : 0) + " message(s) for cwd=" + _cwd);
-            _host.PostMessage("restore", new
+            Log.Write("restore: " + bundle.Tabs.Count + " tab(s) for cwd=" + _cwd);
+
+            bool first = true;
+            foreach (var rec in bundle.Tabs)
             {
-                messages = hasMsgs ? rec.Messages : new System.Collections.Generic.List<StoredMessage>(),
-                model = _model,
-                mode = _permissionMode,
-                effort = _effort,
-                showThinking = _showThinking,
-            });
+                var tabId = rec.TabId ?? "t1";
+                // Reuse the initial t1, create new TabState for extras.
+                TabState tab;
+                if (first && _tabs.ContainsKey("t1") && _tabs["t1"].Record == null)
+                {
+                    tab = _tabs["t1"];
+                    // If stored tab id differs from "t1" remap it.
+                    if (tabId != "t1")
+                    {
+                        _tabs.Remove("t1");
+                        tab = new TabState(tabId);
+                        _tabs[tabId] = tab;
+                        if (_activeTabId == "t1") _activeTabId = tabId;
+                    }
+                    first = false;
+                }
+                else
+                {
+                    if (!_tabs.ContainsKey(tabId))
+                        _tabs[tabId] = new TabState(tabId);
+                    tab = _tabs[tabId];
+                    first = false;
+                }
+
+                var title = rec.TabTitle ?? "Chat";
+                tab.Title = rec.TabTitle;
+                tab.Record = rec;
+                tab.Model = InputValidation.SanitizeModel(rec.Model, "default");
+                tab.PermissionMode = InputValidation.SanitizeChoice(rec.Mode, InputValidation.AllowedModes, "default");
+                tab.Effort = InputValidation.SanitizeChoice(rec.Effort, InputValidation.AllowedEfforts, "none");
+                tab.ShowThinking = rec.ShowThinking;
+                bool hasMsgs = rec.Messages != null && rec.Messages.Count > 0;
+                if (hasMsgs && !string.IsNullOrEmpty(rec.SessionId)) tab.PendingResumeId = rec.SessionId;
+
+                bool isActive = bundle.ActiveTabId == tabId || (bundle.ActiveTabId == null && tab.TabId == _activeTabId);
+
+                // Announce the tab to JS (tabCreated for non-initial tabs, update for the initial one).
+                if (tab.TabId != _activeTabId || !isActive)
+                    _host.PostMessage("tabCreated", new { tabId = tab.TabId, title = title, active = isActive });
+                else
+                    _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = title });
+
+                _host.PostMessage("restore", new
+                {
+                    tabId = tab.TabId,
+                    messages = hasMsgs ? rec.Messages : new System.Collections.Generic.List<StoredMessage>(),
+                    model = tab.Model,
+                    mode = tab.PermissionMode,
+                    effort = tab.Effort,
+                    showThinking = tab.ShowThinking,
+                });
+            }
+
+            // Activate the right tab.
+            if (!string.IsNullOrEmpty(bundle.ActiveTabId) && _tabs.ContainsKey(bundle.ActiveTabId) && bundle.ActiveTabId != _activeTabId)
+            {
+                _activeTabId = bundle.ActiveTabId;
+                _host.PostMessage("tabSwitched", new { tabId = _activeTabId });
+            }
+
+            // Ensure new tabs get indices above the restored ones.
+            _nextTabIndex = Math.Max(_nextTabIndex, _tabs.Count);
         }
 
         /// <summary>
@@ -1534,9 +1704,33 @@ namespace ClaudeCode.VisualStudio
         {
             string text = GetStr(payload, "text") ?? string.Empty;
             var images = ParseImages(payload);
+            var tab = ActiveTab;  // capture active tab — send runs on background thread
+            if (tab == null)
+            {
+                // _activeTabId points at a tab that isn't in _tabs (can happen after a restore
+                // whose stored ActiveTabId no longer matches any restored tab). Rather than
+                // silently drop the message — which looks like "nothing happens" to the user —
+                // recover by adopting the first tab we have, or minting a fresh one.
+                Log.Write("HandleSend: ActiveTab is null (activeTabId=" + (_activeTabId ?? "null")
+                    + ", tabs=" + _tabs.Count + ") — recovering");
+                var firstId = _tabs.Keys.FirstOrDefault();
+                if (firstId != null)
+                {
+                    _activeTabId = firstId;
+                }
+                else
+                {
+                    _activeTabId = "t1";
+                    _tabs["t1"] = new TabState("t1");
+                    _host.PostMessage("tabCreated", new { tabId = "t1", title = "Chat", active = true });
+                }
+                _host.PostMessage("tabSwitched", new { tabId = _activeTabId });
+                tab = ActiveTab;
+                if (tab == null) { Log.Write("HandleSend: recovery failed, dropping message"); return; }
+            }
 
-            Log.WriteVerbose("HandleSend: text=" + (text.Length > 60 ? text.Substring(0, 60) : text));
-            _host.PostMessage("status", new { state = "thinking" });
+            Log.Write("HandleSend: enter tabId=" + tab.TabId + " len=" + text.Length);
+            _host.PostMessage("status", new { state = "thinking", tabId = tab.TabId });
 
             // Spawn/send on a background thread so nothing on the UI thread can block it.
             _ = System.Threading.Tasks.Task.Run(async () =>
@@ -1563,25 +1757,37 @@ namespace ClaudeCode.VisualStudio
                     if (attachedSel != null && attachedSel.HasSelection)
                         _host.PostMessage("sentSelection", new
                         {
+                            tabId = tab.TabId,
                             filePath = attachedSel.FilePath,
                             startLine = attachedSel.StartLine,
                             endLine = attachedSel.EndLine,
                         });
 
                     await EnsureWorkingDirectoryAsync();
-                    EnsureSession();
-                    _lastSentText = prefix + text;
-                    _lastSentImages = images;
-                    _resumeRetried = false;
-                    _session.SendUserMessage(prefix + text, images);
-                    AppendHistory("user", text);
+                    EnsureSessionForTab(tab);
+                    tab.LastSentText = prefix + text;
+                    tab.LastSentImages = images;
+                    tab.ResumeRetried = false;
+                    Log.Write("HandleSend: writing to stdin len=" + (prefix + text).Length);
+                    tab.Session.SendUserMessage(prefix + text, images);
+                    Log.Write("HandleSend: stdin write done, appending history");
+                    AppendHistoryForTab(tab, "user", text);
+
+                    // Set tab title from the first user message (if not yet named).
+                    if (tab.Title == null && !string.IsNullOrWhiteSpace(text))
+                    {
+                        tab.Title = MakeTabTitle(text);
+                        if (tab.Record != null) tab.Record.TabTitle = tab.Title;
+                        _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = tab.Title });
+                    }
+
                     Log.Write("HandleSend: message sent");
                 }
                 catch (Exception ex)
                 {
                     Log.Write("HandleSend EXCEPTION: " + ex);
-                    _host.PostMessage("error", new { message = ex.ToString() });
-                    _host.PostMessage("status", new { state = "idle" });
+                    _host.PostMessage("error", new { tabId = tab.TabId, message = ex.ToString() });
+                    _host.PostMessage("status", new { state = "idle", tabId = tab.TabId });
                 }
             });
         }
@@ -1593,7 +1799,6 @@ namespace ClaudeCode.VisualStudio
             try
             {
                 var sel = await _ide.GetActiveSelectionAsync();
-                var openFiles = await _ide.GetOpenFilesAsync();
                 var diags = await _ide.GetDiagnosticsAsync(30);
                 var dbg = await _debug.GetDebugStateAsync();
 
@@ -1642,14 +1847,7 @@ namespace ClaudeCode.VisualStudio
                     }
                 }
 
-                if (openFiles != null && openFiles.Count > 0)
-                {
-                    any = true;
-                    sb.AppendLine("Open editors:");
-                    for (int i = 0; i < openFiles.Count && i < 20; i++) sb.Append("- ").AppendLine(openFiles[i]);
-                }
-
-                if (diags != null && diags.Count > 0)
+                if (dbg != null && dbg.IsActive && diags != null && diags.Count > 0)
                 {
                     any = true;
                     sb.AppendLine("Problems (VS Error List):");
@@ -1667,39 +1865,35 @@ namespace ClaudeCode.VisualStudio
             catch { return new ContextPrefix(); }
         }
 
-        private void EnsureSession()
+        private void EnsureSession() => EnsureSessionForTab(ActiveTab);
+        private void EnsureSessionForTab(TabState tab)
         {
-            if (_session != null && _session.IsRunning && !_optionsDirty)
-            {
+            if (tab == null) return;
+            if (tab.Session != null && tab.Session.IsRunning && !tab.OptionsDirty)
                 return;
-            }
 
             string resume = null;
-            if (_session != null)
+            if (tab.Session != null)
             {
                 // Restart to apply new model/mode but keep the conversation via --resume.
-                resume = _session.SessionId;
-                _session.Dispose();
-                _session = null;
+                resume = tab.Session.SessionId;
+                tab.Session.Dispose();
+                tab.Session = null;
             }
 
             // First start after a restore: resume the persisted CLI session.
-            if (resume == null && !string.IsNullOrEmpty(_pendingResumeId))
+            if (resume == null && !string.IsNullOrEmpty(tab.PendingResumeId))
             {
-                resume = _pendingResumeId;
-                _pendingResumeId = null;
+                resume = tab.PendingResumeId;
+                tab.PendingResumeId = null;
             }
 
             // Last resort, from the persisted record itself. ResetSession clears the record, so a
-            // deliberately-new session can never pick a conversation back up here. This keeps the
-            // resolution in step with ResumableSessionId(), which callers use to decide whether
-            // starting the CLI would actually restore a conversation.
-            if (resume == null && !string.IsNullOrEmpty(_record?.SessionId))
-            {
-                resume = _record.SessionId;
-            }
+            // deliberately-new session can never pick a conversation back up here.
+            if (resume == null && !string.IsNullOrEmpty(tab.Record?.SessionId))
+                resume = tab.Record.SessionId;
 
-            _optionsDirty = false;
+            tab.OptionsDirty = false;
 
             var options = new ClaudeSessionOptions
             {
@@ -1710,43 +1904,41 @@ namespace ClaudeCode.VisualStudio
                 ResumeSessionId = resume,
             };
 
-            Log.Write("starting claude session, cwd=" + _cwd);
-            _session = new ClaudeSession(options);
-            HookSession(_session);
-            _session.Start();
+            Log.Write("starting claude session, cwd=" + _cwd + " tabId=" + tab.TabId + " proxy=" + (ReadProxyUrl() ?? "none"));
+            tab.Session = new ClaudeSession(options);
+            HookSession(tab.Session, tab);
+            tab.Session.Start();
         }
 
-        private void HookSession(ClaudeSession s)
+        private void HookSession(ClaudeSession s, TabState tab)
         {
+            var watchdogCts = new System.Threading.CancellationTokenSource();
             s.SystemInit += i =>
             {
+                watchdogCts.Cancel();
+                Log.Write("system/init: model=" + (i.Model ?? "?") + " session=" + (i.SessionId ?? "none") + " tabId=" + tab.TabId);
                 _tools = i.Tools ?? new List<string>();
                 _mcpServers = i.McpServers ?? new List<string>();
-                _host.PostMessage("system", new { subtype = "init", model = i.Model, cwd = i.Cwd });
+                _host.PostMessage("system", new { tabId = tab.TabId, subtype = "init", model = i.Model, cwd = i.Cwd });
                 _host.PostMessage("commands", new { commands = i.SlashCommands });
             };
-            s.AssistantStart += () => _host.PostMessage("assistantStart", new { });
-            s.TextDelta += t => _host.PostMessage("assistantDelta", new { text = t });
-            s.ThinkingDelta += t => _host.PostMessage("thinkingDelta", new { text = t });
+            s.AssistantStart += () => _host.PostMessage("assistantStart", new { tabId = tab.TabId });
+            s.TextDelta += t => _host.PostMessage("assistantDelta", new { tabId = tab.TabId, text = t });
+            s.ThinkingDelta += t => _host.PostMessage("thinkingDelta", new { tabId = tab.TabId, text = t });
             s.ToolUse += t =>
             {
-                _host.PostMessage("toolUse", new { id = t.Id, name = t.Name, input = RawJson(t.InputJson) });
-                TrackEditedFile(t);
+                _host.PostMessage("toolUse", new { tabId = tab.TabId, id = t.Id, name = t.Name, input = RawJson(t.InputJson) });
+                TrackEditedFileForTab(tab, t);
             };
             s.ToolResult += r =>
             {
-                _host.PostMessage("toolResult", new { id = r.ToolUseId, content = r.Content, isError = r.IsError });
-                // The chat now renders the diff inline (red/green) per edit. We no longer auto-pop a
-                // native VS diff window for every edit (tab clutter during agentic loops); the pre-edit
-                // snapshot is kept so the card's "Open diff" button can open the full native diff on
-                // demand. Drop the snapshot on a failed edit — there's nothing to compare.
-                if (r.IsError && r.ToolUseId != null) _editedFiles.Remove(r.ToolUseId);
+                _host.PostMessage("toolResult", new { tabId = tab.TabId, id = r.ToolUseId, content = r.Content, isError = r.IsError });
+                if (r.IsError && r.ToolUseId != null) tab.EditedFiles.Remove(r.ToolUseId);
             };
-            s.AssistantEnd += () => _host.PostMessage("assistantEnd", new { });
-            // Real context size, measured per API request. The `result` totals below are cumulative
-            // over the turn and must not drive the ring.
+            s.AssistantEnd += () => _host.PostMessage("assistantEnd", new { tabId = tab.TabId });
             s.ContextUsage += u => _host.PostMessage("contextUsage", new
             {
+                tabId = tab.TabId,
                 promptTokens = u.PromptTokens,
                 totalTokens = u.TotalTokens,
                 cacheCreationTokens = u.CacheCreationTokens,
@@ -1757,6 +1949,7 @@ namespace ClaudeCode.VisualStudio
             {
                 _host.PostMessage("result", new
                 {
+                    tabId = tab.TabId,
                     costUsd = r.CostUsd,
                     inputTokens = r.InputTokens,
                     outputTokens = r.OutputTokens,
@@ -1766,65 +1959,154 @@ namespace ClaudeCode.VisualStudio
                     model = r.Model,
                     durationMs = r.DurationMs,
                 });
-                _host.PostMessage("status", new { state = "idle" });
+                _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
 
-                // A /compact turn produces no assistant reply worth keeping, so it is not appended
-                // to the transcript. The turn simply ends here — the CLI compacted in place and
-                // reported it via the Compacted event below; there is no session to restart.
-                if (!_compacting && !r.IsError)
-                {
-                    AppendHistory("assistant", r.Text);
-                }
-                _compacting = false;
+                if (!tab.Compacting && !r.IsError)
+                    AppendHistoryForTab(tab, "assistant", r.Text);
+                tab.Compacting = false;
             };
             s.Compacted += c => _host.PostMessage("compacted", new
             {
-                trigger = c.Trigger,          // "manual" from the button or /compact, "auto" when the window filled
+                tabId = tab.TabId,
+                trigger = c.Trigger,
                 preTokens = c.PreTokens,
                 postTokens = c.PostTokens,
                 durationMs = c.DurationMs,
             });
-            s.PermissionRequest += p => _host.PostMessage("permission", new { id = p.RequestId, tool = p.ToolName, input = RawJson(p.InputJson) });
-            // Auto mode answered a card that was still on screen: close it out in the transcript.
-            s.PermissionAutoAllowed += id => _host.PostMessage("permissionResolved", new { id, behavior = "allow" });
-            // The CLI refused the live switch — fall back to relaunching with the new mode.
-            s.PermissionModeChangeFailed += m => _optionsDirty = true;
-            s.ErrorEvent += m => _host.PostMessage("error", new { message = m });
+            s.PermissionRequest += p => _host.PostMessage("permission", new { tabId = tab.TabId, id = p.RequestId, tool = p.ToolName, input = RawJson(p.InputJson) });
+            s.PermissionAutoAllowed += id => _host.PostMessage("permissionResolved", new { tabId = tab.TabId, id, behavior = "allow" });
+            s.PermissionModeChangeFailed += m => tab.OptionsDirty = true;
+            s.ErrorEvent += m => _host.PostMessage("error", new { tabId = tab.TabId, message = m });
             s.Exited += code =>
             {
-                _host.PostMessage("status", new { state = "idle" });
+                watchdogCts.Cancel();
+                _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
                 Log.Write("claude process exited (code " + code + ")");
                 if (code == 0) return;
 
-                // A resume id the CLI can't find kills every launch before it reads a message, so
-                // the same turn fails identically for ever. The id is the only broken part - drop
-                // it and replay the turn on a fresh session, once, rather than making the user
-                // find and clear it themselves.
-                if (s.ResumeRejected && !_resumeRetried)
+                // The session was replaced (Retry, New Session, tab close, or watchdog cleared
+                // it). Suppress the error — the UI already moved on or was cleared.
+                if (tab.Session != s) { Log.Write("replaced session exited (code " + code + "), suppressed"); return; }
+
+                if (s.ResumeRejected && !tab.ResumeRetried)
                 {
-                    _resumeRetried = true;
+                    tab.ResumeRetried = true;
                     Log.Write("resume rejected - dropping stale session id and retrying on a fresh session");
-                    RetryOnFreshSession();
+                    RetryOnFreshSession(tab);
                     return;
                 }
 
-                // Otherwise report what the CLI actually said. This used to assert a login problem
-                // for every non-zero exit, which sent users to a terminal to fix an account that
-                // was never broken; the real stderr was captured and then thrown away.
                 var why = (s.LastError ?? string.Empty).Trim();
                 _host.PostMessage("error", new
                 {
+                    tabId = tab.TabId,
                     message = why.Length > 0
                         ? "claude exited (code " + code + "): " + Tail(why, 300)
                         : "claude exited (code " + code + ") without reporting a reason. If this repeats, check that you are signed in.",
-                    // Only offer the login route when the CLI actually pointed at authentication.
                     login = why.Length == 0 || LooksLikeAuthFailure(why),
                 });
             };
             s.Diagnostic += d => Log.Write("diag: " + d);
+
+            // Watchdog: if system/init doesn't arrive within 60 s, the proxy is likely down.
+            // Cancelled by SystemInit (success) or Exited (process died naturally).
+            // Phase 1 (3 s): quick proxy reachability check — fail fast if port is not open.
+            // Phase 2 (60 s): if proxy is reachable but CLI still hasn't connected, show a longer error.
+            var proxyUrl = ReadProxyUrl();
+            Log.Write("HookSession: watchdog armed, proxy=" + (proxyUrl ?? "none"));
+            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
+            {
+                try
+                {
+                    // Phase 1: 3-second fast-fail when the proxy port is not even open.
+                    if (!string.IsNullOrEmpty(proxyUrl))
+                    {
+                        await System.Threading.Tasks.Task.Delay(3000, watchdogCts.Token);
+                        if (tab.Session == s)
+                        {
+                            bool proxyUp = false;
+                            try
+                            {
+                                var uri = new Uri(proxyUrl);
+                                var port = uri.Port > 0 ? uri.Port : (uri.Scheme == "https" ? 443 : 80);
+                                using var tcp = new System.Net.Sockets.TcpClient();
+                                var ct = tcp.ConnectAsync(uri.Host, port);
+                                proxyUp = await System.Threading.Tasks.Task.WhenAny(ct, System.Threading.Tasks.Task.Delay(1500)) == ct && !ct.IsFaulted;
+                            }
+                            catch { }
+                            Log.Write("HookSession: Phase 1 proxy " + (proxyUp ? "up" : "DOWN") + " for " + tab.TabId);
+                            if (!proxyUp)
+                            {
+                                // Kill the hung process immediately — it will never connect to a
+                                // proxy that isn't listening, and leaving it alive means the next
+                                // Retry call finds tab.Session.IsRunning=true and reuses the broken
+                                // session instead of starting a fresh one. Detach first so its Exited
+                                // callback stays suppressed (tab.Session != s).
+                                if (tab.Session == s)
+                                {
+                                    var dead = s;
+                                    tab.Session = null;
+                                    try { dead.Dispose(); } catch { }
+                                }
+                                _host.PostMessage("error", new { tabId = tab.TabId, message = "The proxy at " + proxyUrl + " is not reachable. Make sure it is running, then click Retry.", login = false, retry = true });
+                                _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
+                                return;
+                            }
+                        }
+                    }
+
+                    // Phase 2: 60-second timeout — proxy is up but CLI hasn't responded.
+                    await System.Threading.Tasks.Task.Delay(57_000, watchdogCts.Token); // 3+57 = 60 s total
+                    if (tab.Session == s)
+                    {
+                        // If this was a --resume attempt, the stored session ID is stale (the
+                        // conversation cannot be resumed). Clear it now so the next start — after
+                        // the user clicks Retry — launches a fresh CLI without --resume. Without
+                        // this the user is stuck in a loop: every Retry re-uses the same dead ID,
+                        // hangs 60 s again, and the cycle repeats indefinitely.
+                        bool wasResume = !string.IsNullOrEmpty(tab.Record?.SessionId);
+
+                        // Log BEFORE SaveAllTabs — DPAPI can block on corporate machines, so if it
+                        // stalls this entry confirms Phase 2 fired and shows the stale-resume state.
+                        Log.Write("HookSession: watchdog fired — no system/init after 60 s for " + tab.TabId
+                            + (wasResume ? " (stale resume id cleared)" : ""));
+
+                        tab.PendingResumeId = null;
+                        if (tab.Record != null) { tab.Record.SessionId = null; SaveAllTabs(); }
+
+                        // Re-check: RestartTabSession or another watchdog may have already replaced
+                        // this session while SaveAllTabs was running. Only kill + show error if we
+                        // still own the tab.
+                        if (tab.Session != s) return;
+
+                        // Kill the hung process. It is almost certainly blocked on the file lock of
+                        // the --resume session id (held by an earlier CLI that never exited), so it
+                        // will never connect to the proxy and never close on its own — leaving it
+                        // running would keep that lock held and orphan yet another process. Detach
+                        // the reference first so its Exited callback stays suppressed (!= s above).
+                        var dead = s;
+                        tab.Session = null;
+                        try { dead.Dispose(); } catch { }
+
+                        string msg;
+                        if (wasResume)
+                            msg = "Could not reconnect to the previous conversation (the session may have expired). "
+                                + "Click Retry to start a fresh session — your chat history is preserved.";
+                        else if (string.IsNullOrEmpty(proxyUrl))
+                            msg = "Claude CLI did not respond after 60 s. Check your internet connection, then click Retry.";
+                        else
+                            msg = "Claude CLI did not respond after 60 s. The proxy at " + proxyUrl
+                                + " is reachable but Claude did not connect. Check authentication or network routing, then click Retry.";
+
+                        _host.PostMessage("error", new { tabId = tab.TabId, message = msg, login = false, retry = true });
+                        _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
+                    }
+                }
+                catch (OperationCanceledException) { }
+            }).FireAndForget();
         }
 
-        private void TrackEditedFile(ToolUseInfo t)
+        private void TrackEditedFileForTab(TabState tab, ToolUseInfo t)
         {
             if (t?.Name == null) return;
             switch (t.Name)
@@ -1841,10 +2123,8 @@ namespace ClaudeCode.VisualStudio
                             var path = fp.GetString();
                             string old = null;
                             try { if (File.Exists(path)) old = File.ReadAllText(path); } catch { }
-                            // Kept for the on-demand "Open diff" button. Bound the memory: a very long
-                            // agentic session could touch many large files.
-                            if (_editedFiles.Count > 200) _editedFiles.Clear();
-                            _editedFiles[t.Id] = new EditSnapshot { Path = path, OldText = old };
+                            if (tab.EditedFiles.Count > 200) tab.EditedFiles.Clear();
+                            tab.EditedFiles[t.Id] = new EditSnapshot { Path = path, OldText = old };
                         }
                     }
                     catch { }
@@ -1971,36 +2251,33 @@ namespace ClaudeCode.VisualStudio
         // a built-in that posts the same "compact" message, and shadows the CLI's own /compact).
         private void HandleCompact()
         {
-            // A conversation restored from disk — or one whose process has since exited — has no
-            // live CLI holding it, but its context is still on disk and resumable. Refusing there
-            // was wrong, and worst exactly when compaction is wanted: a long conversation reopened
-            // the next day, ring full, button dead. Start (resuming) the same way a send does, and
-            // keep the refusal only for the case where there is genuinely nothing to compact.
-            bool live = _session != null && _session.IsRunning;
-            if (!live && string.IsNullOrEmpty(ResumableSessionId()))
+            var tab = ActiveTab;
+            if (tab == null) return;
+            bool live = tab.Session != null && tab.Session.IsRunning;
+            if (!live && string.IsNullOrEmpty(ResumableSessionId(tab)))
             {
-                _host.PostMessage("error", new { message = "Nothing to compact yet — send a message first." });
+                _host.PostMessage("error", new { tabId = tab.TabId, message = "Nothing to compact yet — send a message first." });
                 return;
             }
 
-            _compacting = true;
-            _host.PostMessage("status", new { state = "thinking" });
+            tab.Compacting = true;
+            _host.PostMessage("status", new { tabId = tab.TabId, state = "thinking" });
             ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
                 try
                 {
                     await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-                    if (!live) Log.Write("compact: no live session, resuming " + ResumableSessionId());
+                    if (!live) Log.Write("compact: no live session, resuming " + ResumableSessionId(tab));
                     await EnsureWorkingDirectoryAsync();
-                    EnsureSession();
-                    _session.SendUserMessage("/compact", null);
+                    EnsureSessionForTab(tab);
+                    tab.Session.SendUserMessage("/compact", null);
                 }
                 catch (Exception ex)
                 {
-                    _compacting = false;
+                    tab.Compacting = false;
                     Log.Write("HandleCompact: " + ex.Message);
-                    _host.PostMessage("error", new { message = ex.Message });
-                    _host.PostMessage("status", new { state = "idle" });
+                    _host.PostMessage("error", new { tabId = tab.TabId, message = ex.Message });
+                    _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
                 }
             }).FireAndForget();
         }
@@ -2010,11 +2287,12 @@ namespace ClaudeCode.VisualStudio
         /// Mirrors the order <see cref="EnsureSession"/> resolves it in, so a caller can tell
         /// whether starting the CLI would actually bring a conversation back with it.
         /// </summary>
-        private string ResumableSessionId()
+        private string ResumableSessionId(TabState tab = null)
         {
-            if (!string.IsNullOrEmpty(_session?.SessionId)) return _session.SessionId;
-            if (!string.IsNullOrEmpty(_pendingResumeId)) return _pendingResumeId;
-            return _record?.SessionId;
+            var t = tab ?? ActiveTab;
+            if (!string.IsNullOrEmpty(t?.Session?.SessionId)) return t.Session.SessionId;
+            if (!string.IsNullOrEmpty(t?.PendingResumeId)) return t.PendingResumeId;
+            return t?.Record?.SessionId;
         }
 
         private static string MediaTypeForExt(string ext)
@@ -2035,7 +2313,7 @@ namespace ClaudeCode.VisualStudio
             string id = GetStr(payload, "id");
             string behavior = GetStr(payload, "behavior") ?? "deny";
             if (behavior == "allow_always") behavior = "allow";
-            _session?.RespondToPermission(id, behavior == "deny" ? "deny" : "allow", null);
+            ActiveTab?.Session?.RespondToPermission(id, behavior == "deny" ? "deny" : "allow", null);
         }
 
         /// <summary>
@@ -2043,33 +2321,33 @@ namespace ClaudeCode.VisualStudio
         /// The transcript is kept: only the CLI-side conversation is gone, and re-sending is what
         /// the user would otherwise do by hand after being told to clear something invisible.
         /// </summary>
-        private void RetryOnFreshSession()
+        private void RetryOnFreshSession(TabState tab)
         {
             _ = System.Threading.Tasks.Task.Run(() =>
             {
                 try
                 {
-                    _session?.Dispose();
-                    _session = null;
-                    _pendingResumeId = null;
-                    if (_record != null)
+                    tab.Session?.Dispose();
+                    tab.Session = null;
+                    tab.PendingResumeId = null;
+                    if (tab.Record != null)
                     {
-                        _record.SessionId = null;
-                        SessionStore.Save(_cwd, _record);
+                        tab.Record.SessionId = null;
+                        SaveAllTabs();
                     }
 
-                    if (string.IsNullOrEmpty(_lastSentText)) return;
+                    if (string.IsNullOrEmpty(tab.LastSentText)) return;
 
-                    _host.PostMessage("status", new { state = "thinking" });
-                    EnsureSession();
-                    _session.SendUserMessage(_lastSentText, _lastSentImages);
+                    _host.PostMessage("status", new { tabId = tab.TabId, state = "thinking" });
+                    EnsureSessionForTab(tab);
+                    tab.Session.SendUserMessage(tab.LastSentText, tab.LastSentImages);
                     Log.Write("resume retry: message re-sent on a fresh session");
                 }
                 catch (Exception ex)
                 {
                     Log.Write("RetryOnFreshSession: " + ex.Message);
-                    _host.PostMessage("status", new { state = "idle" });
-                    _host.PostMessage("error", new { message = "Could not restart the conversation: " + ex.Message });
+                    _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
+                    _host.PostMessage("error", new { tabId = tab.TabId, message = "Could not restart the conversation: " + ex.Message });
                 }
             });
         }
@@ -2084,29 +2362,50 @@ namespace ClaudeCode.VisualStudio
                 || t.Contains("api key") || t.Contains("oauth") || t.Contains("401") || t.Contains("403");
         }
 
-        private void ResetSession()
+        private void ResetSession() => ResetSessionForTab(ActiveTab);
+
+        private void ResetSessionForTab(TabState tab)
         {
-            _session?.Dispose();
-            _session = null;
-            _pendingResumeId = null;
-            _record = null;
-            SessionStore.Clear(_cwd);
-            _host.PostMessage("clear", new { });
+            if (tab == null) return;
+            tab.Session?.Dispose();
+            tab.Session = null;
+            tab.PendingResumeId = null;
+            tab.Record = null;
+            tab.Title = null;
+            SessionStore.ClearTab(_cwd, tab.TabId);
+            _host.PostMessage("clear", new { tabId = tab.TabId });
+            _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = DefaultTabTitle(tab.TabId) });
         }
 
-        // Persist a turn to the per-cwd session store so the conversation can be restored later.
-        private void AppendHistory(string role, string text)
+        private string DefaultTabTitle(string tabId)
         {
+            int idx = 1;
+            foreach (var k in _tabs.Keys) { if (k == tabId) break; idx++; }
+            return "Chat " + idx;
+        }
+
+        private void AppendHistory(string role, string text) => AppendHistoryForTab(ActiveTab, role, text);
+        private void AppendHistoryForTab(TabState tab, string role, string text)
+        {
+            if (tab == null) return;
             try
             {
-                if (_record == null) _record = new SessionRecord();
-                _record.Messages.Add(new StoredMessage { Role = role, Text = text ?? string.Empty });
-                _record.SessionId = _session?.SessionId ?? _record.SessionId;
-                _record.Model = _model;
-                _record.Mode = _permissionMode;
-                _record.Effort = _effort;
-                _record.ShowThinking = _showThinking;
-                SessionStore.Save(_cwd, _record);
+                if (tab.Record == null) tab.Record = new SessionRecord { TabId = tab.TabId };
+                if (role == "user" && tab.Title == null)
+                {
+                    tab.Title = DeriveTabTitle(text);
+                    if (tab.Title != null)
+                        _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = tab.Title });
+                }
+                tab.Record.TabId = tab.TabId;
+                tab.Record.TabTitle = tab.Title;
+                tab.Record.Messages.Add(new StoredMessage { Role = role, Text = text ?? string.Empty });
+                tab.Record.SessionId = tab.Session?.SessionId ?? tab.Record.SessionId;
+                tab.Record.Model = tab.Model;
+                tab.Record.Mode = tab.PermissionMode;
+                tab.Record.Effort = tab.Effort;
+                tab.Record.ShowThinking = tab.ShowThinking;
+                SaveAllTabs();
             }
             catch { }
         }
@@ -2114,18 +2413,57 @@ namespace ClaudeCode.VisualStudio
         // Persist the current composer options (model / permission mode / effort / show-thinking)
         // immediately when the user changes one, even before any message is sent — otherwise an
         // option change followed by closing VS would be lost.
+
+        private static string DeriveTabTitle(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var line = text.TrimStart().Split('\n')[0].Trim();
+            if (line.Length == 0) return null;
+            const int max = 28;
+            return line.Length <= max ? line : line.Substring(0, max) + "…";
+        }
+
         private void SaveOptions()
         {
             try
             {
-                if (_record == null) _record = new SessionRecord();
-                _record.Model = _model;
-                _record.Mode = _permissionMode;
-                _record.Effort = _effort;
-                _record.ShowThinking = _showThinking;
-                SessionStore.Save(_cwd, _record);
+                var tab = ActiveTab;
+                if (tab == null) return;
+                if (tab.Record == null) tab.Record = new SessionRecord { TabId = tab.TabId };
+                tab.Record.TabId = tab.TabId;
+                tab.Record.TabTitle = tab.Title;
+                tab.Record.Model = tab.Model;
+                tab.Record.Mode = tab.PermissionMode;
+                tab.Record.Effort = tab.Effort;
+                tab.Record.ShowThinking = tab.ShowThinking;
+                SaveAllTabs();
             }
             catch { }
+        }
+
+        private void SaveAllTabs()
+        {
+            try
+            {
+                var bundle = new SessionBundle { ActiveTabId = _activeTabId };
+                foreach (var tab in _tabs.Values)
+                {
+                    if (tab.Record == null) continue;
+                    tab.Record.TabId = tab.TabId;
+                    if (tab.Title != null) tab.Record.TabTitle = tab.Title;
+                    bundle.Tabs.Add(tab.Record);
+                }
+                SessionStore.SaveBundle(_cwd, bundle);
+            }
+            catch { }
+        }
+
+        private static string MakeTabTitle(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            // Strip newlines, collapse whitespace, trim to 32 chars
+            var t = System.Text.RegularExpressions.Regex.Replace(text.Trim(), @"\s+", " ");
+            return t.Length <= 32 ? t : t.Substring(0, 30) + "…";
         }
 
         private static List<ImageInput> ParseImages(JsonElement payload)
@@ -2215,5 +2553,46 @@ namespace ClaudeCode.VisualStudio
             try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true }); }
             catch { }
         }
+
+        // ── Tab management ───────────────────────────────────────────────────────────
+        private void HandleNewTab(string defaultModel = null)
+        {
+            var id = "t" + (++_nextTabIndex);
+            Log.Write("HandleNewTab: creating " + id + " (prev active=" + _activeTabId + ")");
+            var tab = new TabState(id);
+            if (!string.IsNullOrEmpty(defaultModel))
+                tab.Model = InputValidation.SanitizeModel(defaultModel, "default");
+            _tabs[id] = tab;
+            _host.PostMessage("tabCreated", new { tabId = id, title = "Chat " + _nextTabIndex, active = false, model = tab.Model });
+            _activeTabId = id;
+            _host.PostMessage("tabSwitched", new { tabId = id });
+            Log.Write("HandleNewTab: done, activeTabId=" + _activeTabId);
+        }
+
+        private void HandleSwitchTab(string tabId)
+        {
+            Log.Write("HandleSwitchTab: " + tabId + " (prev=" + _activeTabId + ")");
+            if (tabId == null || !_tabs.ContainsKey(tabId) || tabId == _activeTabId) return;
+            _activeTabId = tabId;
+            _host.PostMessage("tabSwitched", new { tabId = tabId });
+            SaveAllTabs();
+        }
+
+        private void HandleCloseTab(string tabId)
+        {
+            if (tabId == null || !_tabs.TryGetValue(tabId, out var tab)) return;
+            if (_tabs.Count <= 1) return; // always keep at least one tab
+            tab.Session?.Dispose();
+            _tabs.Remove(tabId);
+            SessionStore.ClearTab(_cwd, tabId);
+            if (_activeTabId == tabId)
+            {
+                _activeTabId = System.Linq.Enumerable.First(_tabs.Keys);
+                _host.PostMessage("tabSwitched", new { tabId = _activeTabId });
+            }
+            _host.PostMessage("tabClosed", new { tabId = tabId });
+            SaveAllTabs();
+        }
+        // ── end tab management ────────────────────────────────────────────────────────
     }
 }

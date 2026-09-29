@@ -15,16 +15,9 @@ namespace ClaudeCode.VisualStudio
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
     [InstalledProductRegistration("Claude Code", "Agentic coding assistant for Visual Studio.", "1.0.17")]
     [ProvideMenuResource("Menus.ctmenu", 1)]
-    // Dock as a tab next to Solution Explorer (its window GUID), instead of a free-floating right pane.
-    [ProvideToolWindow(typeof(ClaudeChatToolWindow.Pane), Style = VsDockStyle.Tabbed, Window = "3AE79031-E1BC-11D0-8F78-00A0C9110057")]
-    // Auto-show the chat when a debug session starts. VS loads a separate "Debug" window layout
-    // on F5, which otherwise hides tool windows that were open in the design layout — so the user
-    // had to re-open Claude every time they started debugging. Tying it to the Debugging UI context
-    // makes VS surface it automatically.
+    // Multi-instance: Style=Linked creates floating/dockable instances; each gets its own id.
+    [ProvideToolWindow(typeof(ClaudeChatToolWindow.Pane), Style = VsDockStyle.Tabbed, Window = "3AE79031-E1BC-11D0-8F78-00A0C9110057", MultiInstances = true)]
     [ProvideToolWindowVisibility(typeof(ClaudeChatToolWindow.Pane), Microsoft.VisualStudio.VSConstants.UICONTEXT.Debugging_string)]
-    // Load at shell startup (background) so we can surface the chat on first install. VS never
-    // auto-opens a tool window until it has been shown once, so a fresh install leaves the user
-    // hunting in View → Claude Code; loading here lets InitializeAsync show it the first time.
     [ProvideAutoLoad(Microsoft.VisualStudio.VSConstants.UICONTEXT.ShellInitialized_string, PackageAutoLoadFlags.BackgroundLoad)]
     [Guid(PackageGuids.ClaudeCodePackageString)]
     public sealed class ClaudeCodePackage : ToolkitPackage

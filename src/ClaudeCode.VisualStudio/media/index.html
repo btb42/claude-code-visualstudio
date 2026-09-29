@@ -9,14 +9,12 @@
        attacker-chosen path is a silent exfil channel). Keep it closed until something needs it. -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline' https://claudecode.local; script-src https://claudecode.local; font-src https://claudecode.local; connect-src https://claudecode.local;" />
-  <link rel="stylesheet" href="style.css?v=34" />
+  <link rel="stylesheet" href="style.css?v=39" />
   <title>Claude Code</title>
 </head>
 <body>
   <div id="app">
-    <header id="toolbar">
-      <div class="brand"><span class="logo">✳</span><span class="title">Claude Code</span></div>
-    </header>
+    <div id="tab-bar"></div>
 
     <div id="setupBanner" class="setup-banner hidden"></div>
 
@@ -55,6 +53,6 @@
   </div>
 
   <script src="markdown.js?v=32"></script>
-  <script src="app.js?v=38"></script>
+  <script src="app.js?v=43"></script>
 </body>
 </html>
