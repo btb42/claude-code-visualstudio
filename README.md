@@ -1,5 +1,10 @@
 ﻿# Claude Code for Visual Studio
 
+> fork, with some enhancements / reworked.
+> mail additional feature - more tabs. 
+
+
+
 > **Latest release:** <!-- managed:version -->v1.0.17<!-- /managed:version --> — [download the VSIX from Releases](https://github.com/nachum-shmilovitz-66/claude-code-visualstudio/releases/latest)
 
 Brings the [Claude Code](https://www.anthropic.com/claude-code) agentic coding assistant into
