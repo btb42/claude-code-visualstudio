@@ -1,7 +1,9 @@
 ﻿# Claude Code for Visual Studio
 
-> fork, with some enhancements / reworked.
-> mail additional feature - more tabs. 
+## my changes : 
+
+ fork, with some enhancements / reworked.
+ mail additional feature - more tabs. 
 
 
 
