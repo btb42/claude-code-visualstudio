@@ -266,7 +266,7 @@ namespace ClaudeCode.VisualStudio
                     ResetSession();
                     break;
                 case "newTab":
-                    HandleNewTab(GetStr(message.Payload, "defaultModel"));
+                    HandleNewTab(GetStr(message.Payload, "defaultModel"), GetStr(message.Payload, "defaultMode"));
                     break;
                 case "switchTab":
                     HandleSwitchTab(GetStr(message.Payload, "tabId"));
@@ -1574,13 +1574,14 @@ namespace ClaudeCode.VisualStudio
                 if (first && _tabs.ContainsKey("t1") && _tabs["t1"].Record == null)
                 {
                     tab = _tabs["t1"];
-                    // If stored tab id differs from "t1" remap it.
+                    // If stored tab id differs from "t1" remap it and tell JS to drop the placeholder.
                     if (tabId != "t1")
                     {
                         _tabs.Remove("t1");
                         tab = new TabState(tabId);
                         _tabs[tabId] = tab;
                         if (_activeTabId == "t1") _activeTabId = tabId;
+                        _host.PostMessage("tabClosed", new { tabId = "t1" });
                     }
                     first = false;
                 }
@@ -1604,11 +1605,9 @@ namespace ClaudeCode.VisualStudio
 
                 bool isActive = bundle.ActiveTabId == tabId || (bundle.ActiveTabId == null && tab.TabId == _activeTabId);
 
-                // Announce the tab to JS (tabCreated for non-initial tabs, update for the initial one).
-                if (tab.TabId != _activeTabId || !isActive)
-                    _host.PostMessage("tabCreated", new { tabId = tab.TabId, title = title, active = isActive });
-                else
-                    _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = title });
+                // Always announce via tabCreated so JS gets the correct tab id — the initial "t1"
+                // placeholder sent before restore may have been remapped to a different id here.
+                _host.PostMessage("tabCreated", new { tabId = tab.TabId, title = title, active = isActive });
 
                 _host.PostMessage("restore", new
                 {
@@ -2555,15 +2554,17 @@ namespace ClaudeCode.VisualStudio
         }
 
         // ── Tab management ───────────────────────────────────────────────────────────
-        private void HandleNewTab(string defaultModel = null)
+        private void HandleNewTab(string defaultModel = null, string defaultMode = null)
         {
             var id = "t" + (++_nextTabIndex);
             Log.Write("HandleNewTab: creating " + id + " (prev active=" + _activeTabId + ")");
             var tab = new TabState(id);
             if (!string.IsNullOrEmpty(defaultModel))
                 tab.Model = InputValidation.SanitizeModel(defaultModel, "default");
+            if (!string.IsNullOrEmpty(defaultMode))
+                tab.PermissionMode = InputValidation.SanitizeChoice(defaultMode, InputValidation.AllowedModes, "default");
             _tabs[id] = tab;
-            _host.PostMessage("tabCreated", new { tabId = id, title = "Chat " + _nextTabIndex, active = false, model = tab.Model });
+            _host.PostMessage("tabCreated", new { tabId = id, title = "Chat " + _nextTabIndex, active = false, model = tab.Model, mode = tab.PermissionMode });
             _activeTabId = id;
             _host.PostMessage("tabSwitched", new { tabId = id });
             Log.Write("HandleNewTab: done, activeTabId=" + _activeTabId);

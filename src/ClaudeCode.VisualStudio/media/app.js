@@ -51,6 +51,7 @@
       old.ctx = Object.assign({}, ctx); old.totals = Object.assign({}, totals);
       old.usageText = els.usage.textContent; old.compactPin = compactPin;
       old.cur = Object.assign({}, cur);
+      old.inputDraft = els.input.value;
       old.el.style.display = "none";
     }
     activeTabId = newId;
@@ -60,7 +61,8 @@
     Object.assign(ctx, nw.ctx); Object.assign(totals, nw.totals);
     els.usage.textContent = nw.usageText || ""; compactPin = nw.compactPin || 0;
     Object.assign(cur, nw.cur || { model: "default", mode: "default", effort: "none" });
-    syncUI();
+    els.input.value = nw.inputDraft || "";
+    syncUI(); autoGrow();
     nw.el.style.display = "";
     els.sendBtn.classList.toggle("hidden", running);
     els.stopBtn.classList.toggle("hidden", !running);
@@ -102,7 +104,7 @@
       });
     });
     const nb = bar.querySelector(".tab-new");
-    if (nb) nb.addEventListener("click", function() { post("newTab", { defaultModel: getDefaultModel() }); });
+    if (nb) nb.addEventListener("click", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode() }); });
   }
   // ── end tab management ──────────────────────────────────────────────────────
 
@@ -213,9 +215,6 @@
          " top=" + els.messages.scrollTop + " max=" + maxTop());
     // Nothing that moves while we are hidden is the user scrolling.
     if (hidden) { ignoreScrollUntil = Infinity; return; }
-    // If the session was streaming while we were hidden, new content arrived at the bottom.
-    // Re-pin to bottom so the user sees the latest output, not a stale mid-scroll position.
-    if (running) stickBottom = true;
     restoreScroll("show");
     // An update that completed behind another tab gets its read-time now that it is on screen.
     if (updatedTo) scheduleUpdatedDismiss();
@@ -399,11 +398,19 @@
     const nd = addNode("tool-node", "pending");
     const c = document.createElement("div"); c.className = "tool";
     const h = document.createElement("div"); h.className = "tool-head";
-    h.innerHTML = '<span class="tname">' + window.md.esc(t.name || "tool") + '</span><span class="tsummary">' + window.md.esc(summarize(t.name, t.input)) + '</span><span class="chev">▶</span>';
+    const filePath = t.input && (t.input.file_path || t.input.path);
+    const summary = summarize(t.name, t.input);
+    const summaryHtml = filePath
+      ? '<span class="tsummary fp-link" title="Click to open in Visual Studio">' + window.md.esc(summary) + '</span>'
+      : '<span class="tsummary">' + window.md.esc(summary) + '</span>';
+    h.innerHTML = '<span class="tname">' + window.md.esc(t.name || "tool") + '</span>' + summaryHtml + '<span class="chev">▶</span>';
     const bd = document.createElement("div"); bd.className = "tool-body";
     const edit = isEditTool(t.name) && t.input && t.input.file_path;
     if (edit) { bd.innerHTML = diffBody(t.input, t.name); c.classList.add("open"); }  // show edit diffs expanded by default
     else bd.innerHTML = "<pre>" + window.md.esc(JSON.stringify(t.input || {}, null, 2)) + "</pre>";
+    if (filePath) {
+      h.querySelector(".fp-link").addEventListener("click", (e) => { e.stopPropagation(); post("openFile", { path: filePath }); });
+    }
     h.addEventListener("click", () => c.classList.toggle("open"));
     c.appendChild(h); c.appendChild(bd); nd.main.appendChild(c);
     if (edit) { const od = bd.querySelector(".open-diff"); if (od) od.addEventListener("click", (e) => { e.stopPropagation(); post("openDiff", { id: t.id }); }); }
@@ -645,7 +652,15 @@
     },
     tabCreated: (p) => {
       if (!p || !p.tabId) return;
-      const tab = createTab(p.tabId, p.title || "Chat");
+      // If the tab already exists (e.g. the "t1" placeholder sent before restore), just update it.
+      let tab = tabs.get(p.tabId);
+      if (tab) {
+        if (p.title) tab.title = p.title;
+        if (p.active) { activeTabId = p.tabId; tab.el.style.display = ""; }
+        renderTabBar();
+        return;
+      }
+      tab = createTab(p.tabId, p.title || "Chat");
       // New tabs inherit the stored default model (unless the host already resolved one).
       const dm = p.model || getDefaultModel();
       tab.cur = { model: dm, mode: p.mode || getDefaultMode(), effort: "none" };
@@ -727,12 +742,21 @@
     if (!b) return;
     const name = String(p.filePath).split(/[\\/]/).pop() || p.filePath;
     const rng = p.startLine === p.endLine ? ("L" + p.startLine) : ("L" + p.startLine + "–" + p.endLine);
+    // Virtual VS buffers (Output Window etc.) have no real path — detect by absence of extension
+    // or known virtual names like "Temp.txt".
+    const isVirtual = !name.includes(".") || /^Temp\.txt$/i.test(name) || !/[\\/]/.test(p.filePath) && !p.filePath.includes(":");
     const wrap = document.createElement("div");
     wrap.className = "msg-selection";
-    wrap.innerHTML = '<span class="sel-chip" title="' + window.md.esc(p.filePath + " (lines " + p.startLine + "–" + p.endLine + ") — click to open") + '">'
-      + '<span class="sel-ico">⌗</span><span class="sel-name">' + window.md.esc(name) + '</span>'
-      + '<span class="sel-range">' + window.md.esc(rng) + '</span></span>';
-    wrap.querySelector(".sel-chip").addEventListener("click", () => post("openFile", { path: p.filePath, line: p.startLine }));
+    if (isVirtual) {
+      wrap.innerHTML = '<span class="sel-chip sel-chip-virtual" title="Temporary selected text (Output Window or virtual buffer — not a file on disk)">'
+        + '<span class="sel-ico">⌗</span><span class="sel-name">selected text</span>'
+        + '<span class="sel-range">' + window.md.esc(rng) + '</span></span>';
+    } else {
+      wrap.innerHTML = '<span class="sel-chip" title="' + window.md.esc(p.filePath + " (lines " + p.startLine + "–" + p.endLine + ") — click to open") + '">'
+        + '<span class="sel-ico">⌗</span><span class="sel-name">' + window.md.esc(name) + '</span>'
+        + '<span class="sel-range">' + window.md.esc(rng) + '</span></span>';
+      wrap.querySelector(".sel-chip").addEventListener("click", () => post("openFile", { path: p.filePath, line: p.startLine }));
+    }
     b.insertBefore(wrap, b.firstChild);
   }
 
@@ -1821,6 +1845,162 @@
   }
 
   function closeAll() { closeTop(); closeC(); }
+
+  // ── Right-click context menu ──────────────────────────────────────────────
+  let ctxMenu = null;
+  function closeCtxMenu() { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } }
+
+  document.getElementById("app").addEventListener("contextmenu", function(e) {
+    e.preventDefault();
+    closeCtxMenu();
+    const m = document.createElement("div");
+    m.className = "ctx-menu";
+    const x = Math.min(e.clientX, window.innerWidth - 165);
+    const y = Math.min(e.clientY, window.innerHeight - 90);
+    m.style.left = x + "px";
+    m.style.top = y + "px";
+    function ctxItem(label, action) {
+      const b = document.createElement("button");
+      b.className = "ctx-item";
+      b.textContent = label;
+      b.addEventListener("click", function() { closeCtxMenu(); action(); });
+      m.appendChild(b);
+    }
+    function ctxSep() { const s = document.createElement("div"); s.className = "ctx-sep"; m.appendChild(s); }
+    ctxItem("+ New tab", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode() }); });
+    ctxSep();
+    ctxItem("↺ New session", function() { post("newSession"); });
+    document.body.appendChild(m);
+    ctxMenu = m;
+    setTimeout(function() {
+      document.addEventListener("click", function h() { closeCtxMenu(); document.removeEventListener("click", h); });
+    }, 0);
+  });
+  document.addEventListener("keydown", function(e) { if (e.key === "Escape" && ctxMenu) closeCtxMenu(); }, true);
+  // ── end context menu ──────────────────────────────────────────────────────
+
+  // ── Ctrl+F in-chat search ─────────────────────────────────────────────────
+  let searchBar = null, searchMatches = [], searchIdx = -1, searchQuery = "";
+
+  function openSearch() {
+    if (!searchBar) {
+      searchBar = document.createElement("div");
+      searchBar.className = "search-bar";
+      searchBar.innerHTML =
+        '<input class="search-input" placeholder="Search messages…" />' +
+        '<span class="search-count"></span>' +
+        '<button class="search-nav" id="srchPrev">▲</button>' +
+        '<button class="search-nav" id="srchNext">▼</button>' +
+        '<button class="search-close">✕</button>';
+      document.getElementById("app").appendChild(searchBar);
+      searchBar.querySelector(".search-close").addEventListener("click", closeSearch);
+      searchBar.querySelector("#srchPrev").addEventListener("click", function() { navigateSearch(-1); });
+      searchBar.querySelector("#srchNext").addEventListener("click", function() { navigateSearch(1); });
+      searchBar.querySelector(".search-input").addEventListener("input", function() { runSearch(this.value); });
+      searchBar.querySelector(".search-input").addEventListener("keydown", function(e) {
+        if (e.key === "Enter") { e.preventDefault(); navigateSearch(e.shiftKey ? -1 : 1); }
+        if (e.key === "Escape") { e.preventDefault(); closeSearch(); }
+      });
+    }
+    searchBar.style.display = "flex";
+    const inp = searchBar.querySelector(".search-input");
+    inp.value = searchQuery;
+    inp.focus();
+    inp.select();
+    if (searchQuery) runSearch(searchQuery);
+  }
+
+  function closeSearch() {
+    clearSearchHighlights();
+    if (searchBar) searchBar.style.display = "none";
+    searchMatches = []; searchIdx = -1;
+  }
+
+  function clearSearchHighlights() {
+    els.messages.querySelectorAll(".srch-hl").forEach(function(m) {
+      const parent = m.parentNode;
+      parent.replaceChild(document.createTextNode(m.textContent), m);
+      parent.normalize();
+    });
+    // clear across all tab els
+    tabs.forEach(function(t) {
+      t.el.querySelectorAll(".srch-hl").forEach(function(m) {
+        const parent = m.parentNode;
+        parent.replaceChild(document.createTextNode(m.textContent), m);
+        parent.normalize();
+      });
+    });
+  }
+
+  function runSearch(q) {
+    clearSearchHighlights();
+    searchMatches = []; searchIdx = -1;
+    searchQuery = q;
+    if (!q) { updateSearchCount(); return; }
+    const root = msgRoot();
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    // Walk text nodes in the active messages container
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        const p = node.parentElement;
+        // skip script/style/input and already-highlighted spans
+        if (!p || p.closest("script,style,input,textarea,.search-bar,.search-input")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const toReplace = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      if (re.test(node.nodeValue)) toReplace.push(node);
+      re.lastIndex = 0;
+    }
+    toReplace.forEach(function(tn) {
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      re.lastIndex = 0;
+      while ((m = re.exec(tn.nodeValue)) !== null) {
+        if (m.index > last) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last, m.index)));
+        const span = document.createElement("span");
+        span.className = "srch-hl";
+        span.textContent = m[0];
+        frag.appendChild(span);
+        searchMatches.push(span);
+        last = m.index + m[0].length;
+      }
+      if (last < tn.nodeValue.length) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    });
+    updateSearchCount();
+    if (searchMatches.length > 0) { searchIdx = 0; highlightCurrent(); }
+  }
+
+  function navigateSearch(dir) {
+    if (!searchMatches.length) return;
+    searchIdx = (searchIdx + dir + searchMatches.length) % searchMatches.length;
+    highlightCurrent();
+  }
+
+  function highlightCurrent() {
+    searchMatches.forEach(function(s, i) { s.classList.toggle("srch-hl-cur", i === searchIdx); });
+    if (searchMatches[searchIdx]) searchMatches[searchIdx].scrollIntoView({ block: "center", behavior: "smooth" });
+    updateSearchCount();
+  }
+
+  function updateSearchCount() {
+    if (!searchBar) return;
+    const c = searchBar.querySelector(".search-count");
+    if (!searchMatches.length) c.textContent = searchQuery ? "0 results" : "";
+    else c.textContent = (searchIdx + 1) + " / " + searchMatches.length;
+  }
+
+  document.addEventListener("keydown", function(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+      // Only intercept if the chat panel has focus (not the VS editor)
+      e.preventDefault();
+      openSearch();
+    }
+  });
+  // ── end Ctrl+F search ─────────────────────────────────────────────────────
 
   updateRing();
   applyThinkingVisibility();
