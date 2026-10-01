@@ -7,6 +7,24 @@ follow the `source.extension.vsixmanifest` Identity version. Releases are publis
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-01
+
+This is the first release of the **btb42 fork**. Versioning diverges from the upstream
+(`nachum-shmilovitz-66`) at `1.0.17`; upstream continues its own `1.0.x` line while this
+fork starts its `1.1.x` series with the features below.
+
+- **Multiple conversation tabs.** The panel now hosts several independent conversations side by
+  side. A `+` button opens a new tab; each tab runs its own Claude session against the same
+  working directory, keeps its own message history, model selection, effort level, and usage
+  counters, and shows a running indicator (`●`) while Claude is active. Tabs persist across VS
+  restarts and inherit the starred default permission mode on creation.
+
+- **Fork a conversation from any point.** Every turn carries a fork button (`⑂`). Clicking it
+  opens a new tab that starts from a copy of the conversation up to that turn — the original
+  tab continues unchanged. Forked tabs are marked "Forked from previous conversation" at the
+  top. The fork button is also present in restored sessions, so a saved conversation can be
+  branched without replaying it from scratch.
+
 ## [1.0.17] - 2026-09-07
 
 - **The model picker follows the CLI, so a new model needs no extension update.** The rows were

@@ -4,6 +4,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace ClaudeCode.VisualStudio.Services
 {
@@ -47,6 +48,22 @@ namespace ClaudeCode.VisualStudio.Services
 
         private const int MaxMessages = 200;
 
+        // Per-file mutexes for in-process serialization; cross-process protection is handled
+        // by the FileStream exclusive lock in WriteEncrypted/ReadDecrypted.
+        private static readonly Dictionary<string, SemaphoreSlim> _fileLocks =
+            new Dictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object _lockMapGuard = new object();
+
+        private static SemaphoreSlim GetFileLock(string path)
+        {
+            lock (_lockMapGuard)
+            {
+                if (!_fileLocks.TryGetValue(path, out var sem))
+                    _fileLocks[path] = sem = new SemaphoreSlim(1, 1);
+                return sem;
+            }
+        }
+
         private static string FileFor(string cwd)
         {
             var key = (cwd ?? string.Empty).Trim().ToLowerInvariant();
@@ -72,15 +89,19 @@ namespace ClaudeCode.VisualStudio.Services
         public static void Save(string cwd, SessionRecord rec)
         {
             if (rec == null) return;
+            var path = FileFor(cwd);
+            var sem = GetFileLock(path);
+            sem.Wait();
             try
             {
-                var bundle = LoadBundle(cwd) ?? new SessionBundle();
+                var bundle = LoadBundleNoLock(path) ?? new SessionBundle();
                 var existing = bundle.Tabs.FindIndex(t => t.TabId == rec.TabId);
                 if (existing >= 0) bundle.Tabs[existing] = rec;
                 else bundle.Tabs.Add(rec);
-                SaveBundle(cwd, bundle);
+                SaveBundleNoLock(path, bundle);
             }
             catch { }
+            finally { sem.Release(); }
         }
 
         public static void Clear(string cwd)
@@ -91,30 +112,51 @@ namespace ClaudeCode.VisualStudio.Services
 
         public static void ClearTab(string cwd, string tabId)
         {
+            var path = FileFor(cwd);
+            var sem = GetFileLock(path);
+            sem.Wait();
             try
             {
-                var bundle = LoadBundle(cwd);
+                var bundle = LoadBundleNoLock(path);
                 if (bundle == null) return;
                 bundle.Tabs.RemoveAll(t => t.TabId == tabId);
-                if (bundle.Tabs.Count == 0) Clear(cwd);
-                else SaveBundle(cwd, bundle);
+                if (bundle.Tabs.Count == 0) { try { File.Delete(path); } catch { } }
+                else SaveBundleNoLock(path, bundle);
             }
             catch { }
+            finally { sem.Release(); }
         }
 
         public static SessionBundle LoadBundle(string cwd)
         {
+            var path = FileFor(cwd);
+            var sem = GetFileLock(path);
+            sem.Wait();
+            try { return LoadBundleNoLock(path); }
+            finally { sem.Release(); }
+        }
+
+        public static void SaveBundle(string cwd, SessionBundle bundle)
+        {
+            if (bundle == null) return;
+            var path = FileFor(cwd);
+            var sem = GetFileLock(path);
+            sem.Wait();
+            try { SaveBundleNoLock(path, bundle); }
+            catch { }
+            finally { sem.Release(); }
+        }
+
+        private static SessionBundle LoadBundleNoLock(string path)
+        {
             try
             {
-                var path = FileFor(cwd);
                 if (!File.Exists(path)) return null;
                 var json = ReadDecrypted(path);
                 if (json == null) return null;
-                // Try new bundle format first, fall back to legacy single-record format.
                 if (json.TrimStart().StartsWith("{\"Tabs\"", StringComparison.OrdinalIgnoreCase) ||
                     json.TrimStart().StartsWith("{\"tabs\"", StringComparison.OrdinalIgnoreCase))
                     return JsonSerializer.Deserialize<SessionBundle>(json);
-                // Legacy: single SessionRecord — wrap it in a bundle.
                 var rec = JsonSerializer.Deserialize<SessionRecord>(json);
                 if (rec == null) return null;
                 if (rec.TabId == null) rec.TabId = "t1";
@@ -123,18 +165,13 @@ namespace ClaudeCode.VisualStudio.Services
             catch { return null; }
         }
 
-        public static void SaveBundle(string cwd, SessionBundle bundle)
+        private static void SaveBundleNoLock(string path, SessionBundle bundle)
         {
-            try
-            {
-                if (bundle == null) return;
-                Directory.CreateDirectory(Dir);
-                foreach (var rec in bundle.Tabs)
-                    if (rec.Messages != null && rec.Messages.Count > MaxMessages)
-                        rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
-                WriteEncrypted(FileFor(cwd), JsonSerializer.Serialize(bundle));
-            }
-            catch { }
+            Directory.CreateDirectory(Dir);
+            foreach (var rec in bundle.Tabs)
+                if (rec.Messages != null && rec.Messages.Count > MaxMessages)
+                    rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
+            WriteEncrypted(path, JsonSerializer.Serialize(bundle));
         }
 
         // The transcript can contain anything discussed in chat (incl. secrets), so it is encrypted
@@ -161,18 +198,30 @@ namespace ClaudeCode.VisualStudio.Services
                 }
                 catch { }
 
+                byte[] buf;
                 if (cipher != null)
                 {
-                    var buf = new byte[Magic.Length + cipher.Length];
+                    buf = new byte[Magic.Length + cipher.Length];
                     Buffer.BlockCopy(Magic, 0, buf, 0, Magic.Length);
                     Buffer.BlockCopy(cipher, 0, buf, Magic.Length, cipher.Length);
-                    File.WriteAllBytes(path, buf);
                 }
                 else
                 {
                     // DPAPI unavailable or timed out — fall back to plaintext.
-                    File.WriteAllText(path, json);
+                    buf = Encoding.UTF8.GetBytes(json);
                 }
+
+                // Cross-process exclusive lock: open with FileShare.None so a second VS instance
+                // cannot read a half-written file, then write atomically via a temp file + replace.
+                var tmp = path + ".tmp";
+                File.WriteAllBytes(tmp, buf);
+                using (var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None))
+                {
+                    fs.SetLength(0);
+                    fs.Write(buf, 0, buf.Length);
+                }
+                // Clean up temp file (only used to prepare buf before the exclusive open).
+                try { File.Delete(tmp); } catch { }
             }
             catch
             {
@@ -183,7 +232,13 @@ namespace ClaudeCode.VisualStudio.Services
 
         private static string ReadDecrypted(string path)
         {
-            var bytes = File.ReadAllBytes(path);
+            byte[] bytes;
+            // Use FileShare.Read so concurrent readers are fine, but writers are excluded.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                bytes = new byte[fs.Length];
+                fs.Read(bytes, 0, bytes.Length);
+            }
             if (HasMagic(bytes))
             {
                 var cipher = new byte[bytes.Length - Magic.Length];

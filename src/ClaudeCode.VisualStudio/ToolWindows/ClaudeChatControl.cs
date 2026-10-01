@@ -268,6 +268,9 @@ namespace ClaudeCode.VisualStudio
                 case "newTab":
                     HandleNewTab(GetStr(message.Payload, "defaultModel"), GetStr(message.Payload, "defaultMode"));
                     break;
+                case "forkTab":
+                    HandleForkTab(GetInt(message.Payload, "count", 6));
+                    break;
                 case "switchTab":
                     HandleSwitchTab(GetStr(message.Payload, "tabId"));
                     break;
@@ -370,6 +373,9 @@ namespace ClaudeCode.VisualStudio
                 case "openFile":
                     OpenFileFromWebview(message.Payload);
                     break;
+                case "openToolFile":
+                    OpenToolFileFromWebview(message.Payload);
+                    break;
                 case "openDiff":
                     OpenDiffFromWebview(message.Payload);
                     break;
@@ -426,6 +432,22 @@ namespace ClaudeCode.VisualStudio
                         }
                     }
 
+                    await _ide.OpenFileAsync(path, line > 0 ? (int?)line : null);
+                }
+                catch { }
+            }).FireAndForget();
+        }
+
+        private void OpenToolFileFromWebview(JsonElement payload)
+        {
+            string path = GetStr(payload, "path");
+            if (string.IsNullOrEmpty(path)) return;
+            int line = GetInt(payload, "line", 0);
+            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
+            {
+                try
+                {
+                    if (!System.IO.File.Exists(path)) return;
                     await _ide.OpenFileAsync(path, line > 0 ? (int?)line : null);
                 }
                 catch { }
@@ -2568,6 +2590,34 @@ namespace ClaudeCode.VisualStudio
             _activeTabId = id;
             _host.PostMessage("tabSwitched", new { tabId = id });
             Log.Write("HandleNewTab: done, activeTabId=" + _activeTabId);
+        }
+
+        private void HandleForkTab(int messageCount)
+        {
+            _tabs.TryGetValue(_activeTabId, out var sourceTab);
+            var sourceMsgs = sourceTab?.Record?.Messages ?? new System.Collections.Generic.List<StoredMessage>();
+            var keep = Math.Min(messageCount, sourceMsgs.Count);
+            var lastMsgs = keep > 0 ? sourceMsgs.GetRange(0, keep) : new System.Collections.Generic.List<StoredMessage>();
+
+            var id = "t" + (++_nextTabIndex);
+            Log.Write("HandleForkTab: creating " + id + " from " + _activeTabId + " msgs=" + lastMsgs.Count);
+            var tab = new TabState(id);
+            if (sourceTab != null) { tab.Model = sourceTab.Model; tab.PermissionMode = sourceTab.PermissionMode; }
+            tab.Record = new SessionRecord
+            {
+                TabId = id,
+                TabTitle = "Fork " + _nextTabIndex,
+                Model = tab.Model,
+                Mode = tab.PermissionMode,
+                Messages = new System.Collections.Generic.List<StoredMessage>(lastMsgs)
+            };
+            _tabs[id] = tab;
+            _host.PostMessage("tabCreated", new { tabId = id, title = "Fork " + _nextTabIndex, active = false, model = tab.Model, mode = tab.PermissionMode });
+            _activeTabId = id;
+            _host.PostMessage("tabSwitched", new { tabId = id });
+            if (lastMsgs.Count > 0)
+                _host.PostMessage("restore", new { tabId = id, fork = true, model = tab.Model, mode = tab.PermissionMode, messages = System.Linq.Enumerable.Select(lastMsgs, m => new { role = m.Role, text = m.Text }).ToArray() });
+            SaveAllTabs();
         }
 
         private void HandleSwitchTab(string tabId)

@@ -1,5 +1,5 @@
 :root {
-  --bg: #1e1e1e; --bg-alt: #252526; --bg-input: #3c3c3c; --fg: #d4d4d4; --fg-dim: #9d9d9d;
+  --bg: #1e1e1e; --bg-alt: #252526; --bg-input: #3c3c3c; --fg: #d4d4d4; --fg-dim: #9d9d9d; --fg-strong: #f0f0f0; --fg-mid: #b8b8b8;
   --accent: #cc7a3b; --accent-fg: #ffffff; --border: #3c3c3c; --code-bg: #1b1b1b;
   --green: #4ec9b0; --red: #f48771; --user-bg: #2d3a4f;
   /* Context ring. Its own colour, not --accent: the brand orange read as a warning sitting next to
@@ -61,6 +61,8 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .msg-selection { margin-bottom: 6px; }
 .sel-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; }
 .sel-chip:hover { border-color: var(--fg-dim); }
+.sel-chip-virtual { cursor: default; opacity: .7; border-style: dashed; }
+.sel-chip-virtual:hover { border-color: var(--border); }
 .sel-ico { opacity: .7; }
 .sel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sel-range { opacity: .65; font-variant-numeric: tabular-nums; }
@@ -94,6 +96,12 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .note.err { color: var(--red); font-style: normal; }
 .compacted-divider { display: flex; align-items: center; gap: 12px; margin: 16px 0; color: var(--fg-dim); font-size: 12px; }
 .compacted-divider::before, .compacted-divider::after { content: ""; flex: 1; height: 1px; background: repeating-linear-gradient(90deg, var(--fg-dim) 0, var(--fg-dim) 3px, transparent 3px, transparent 7px); opacity: .4; }
+.fork-divider { display: flex; align-items: center; margin: 4px 0 8px; }
+.fork-divider::before { content: ""; flex: 1; height: 1px; background: var(--border); opacity: 0.3; transition: opacity 0.15s; }
+.fork-divider:hover::before { opacity: 1; }
+.fork-btn { background: none; border: none; cursor: pointer; font-size: 14px; color: var(--fg-strong); padding: 0 2px 0 8px; line-height: 1; flex: 0 0 auto; opacity: 0.5; transition: opacity 0.15s; }
+.fork-divider:hover .fork-btn { opacity: 1; }
+.fork-btn:hover { color: var(--accent); opacity: 1; }
 .compacted-divider span { white-space: nowrap; }
 
 /* Activity timeline (VS Code-style rail with dots) */
@@ -105,9 +113,10 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .node-dot.spin { background: var(--accent); animation: pulse 1.2s infinite; }
 .node-dot.done { background: var(--green); }
 .node-dot.error { background: var(--red); }
-.node-dot.text { background: var(--fg-dim); }
+.node-dot.text { background: var(--ring); }
 .node-dot.perm { background: var(--accent); }
 .node-main { line-height: 1.5; overflow-wrap: anywhere; }
+.text-node > .node-main { padding-left: 12px; }
 .node-main p { margin: 0 0 8px; } .node-main p:last-child { margin-bottom: 0; }
 .node-main pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px; overflow-x: auto; margin: 8px 0; }
 .node-main code { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
@@ -143,8 +152,9 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 /* Tool name in the plain foreground (not the brand accent) and the argument summary dim +
    monospace — matches how the VS Code panel prints "Grep <pattern>" / "Read <path>". The
    summary wraps onto further lines instead of being ellipsised, so long paths stay readable. */
-.tool-head .tname { font-weight: 600; color: var(--fg); flex: 0 0 auto; white-space: nowrap; }
-.tool-head .tsummary { color: var(--fg-dim); font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.tool-head .tname { font-weight: 700; color: var(--fg-strong); flex: 0 0 auto; white-space: nowrap; }
+.tool-head .tsummary { color: var(--fg-mid); font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.tool-head .tsummary.fp-link:hover { text-decoration: underline; color: var(--green); }
 .tool-head .chev { flex: 0 0 auto; color: var(--fg-dim); transition: transform .15s; }
 .tool.open .chev { transform: rotate(90deg); }
 .tool-body { display: none; padding: 6px 0 0; }
@@ -179,6 +189,20 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .perm .allow { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .perm .deny { background: transparent; color: var(--fg); }
 .perm.resolved { opacity: .6; }
+
+/* Todo list (TodoWrite / TodoRead) */
+.todo-list { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; }
+.todo-item { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; border-radius: 4px; font-size: 12px; }
+.todo-item:hover { background: var(--bg-input); }
+.todo-icon { flex: 0 0 auto; font-size: 13px; width: 16px; text-align: center; color: var(--fg-dim); }
+.todo-item.done .todo-icon { color: var(--green); }
+.todo-item.active .todo-icon { color: var(--accent); }
+.todo-text { flex: 1 1 auto; color: var(--fg); }
+.todo-item.done .todo-text { text-decoration: line-through; color: var(--fg-dim); }
+.todo-item.active .todo-text { color: var(--fg-strong); font-weight: 600; }
+.todo-pri { flex: 0 0 auto; font-size: 10px; padding: 1px 5px; border-radius: 3px; color: var(--fg-dim); background: var(--bg-alt); text-transform: uppercase; letter-spacing: .04em; }
+.todo-item.pri-high .todo-pri { color: var(--red); }
+.todo-item.pri-low .todo-pri { color: var(--fg-dim); opacity: .7; }
 
 /* Thinking */
 .thinking { display: flex; gap: 4px; align-items: center; color: var(--fg-dim); font-style: italic; }
@@ -327,6 +351,22 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .palette-input { width: 100%; background: var(--bg-input); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin-bottom: 4px; font-family: inherit; font-size: 13px; }
 .cpop .sec { padding: 0 4px; }
 .cmd-name { font-family: "Cascadia Code", Consolas, monospace; }
+/* right-click context menu */
+.ctx-menu { position: fixed; z-index: 200; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 20px rgba(0,0,0,.55); padding: 4px; min-width: 150px; }
+.ctx-item { display: flex; align-items: center; width: 100%; text-align: left; background: transparent; color: var(--fg); border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; gap: 8px; }
+.ctx-item:hover { background: var(--bg-input); }
+.ctx-sep { height: 1px; background: var(--border); margin: 3px 4px; }
+/* in-chat search bar */
+.search-bar { display: none; position: absolute; top: 40px; right: 8px; z-index: 150; align-items: center; gap: 4px; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5); padding: 5px 8px; }
+.search-input { background: var(--bg-input); color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; font-size: 12px; font-family: inherit; width: 180px; outline: none; }
+.search-input:focus { border-color: var(--accent); }
+.search-count { font-size: 11px; color: var(--fg-dim); min-width: 60px; text-align: center; }
+.search-nav { background: transparent; color: var(--fg-dim); border: 1px solid var(--border); border-radius: 4px; padding: 2px 7px; cursor: pointer; font-size: 11px; }
+.search-nav:hover { background: var(--bg-input); color: var(--fg); }
+.search-close { background: transparent; color: var(--fg-dim); border: none; padding: 2px 6px; cursor: pointer; font-size: 13px; border-radius: 4px; }
+.search-close:hover { color: var(--fg); background: var(--bg-input); }
+.srch-hl { background: rgba(204,122,59,.35); border-radius: 2px; }
+.srch-hl-cur { background: rgba(204,122,59,.8); color: #fff; border-radius: 2px; }
 
 /* first-run onboarding banner */
 .setup-banner { flex: 0 0 auto; background: var(--bg-alt); border-bottom: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 10px 12px; font-size: 12px; }

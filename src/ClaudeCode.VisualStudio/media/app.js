@@ -32,7 +32,7 @@
     el.className = "tab-pane";
     el.id = "tab-pane-" + id;
     els.messages.appendChild(el);
-    const tab = { id: id, title: title, el: el, running: false, currentTurn: null, currentAssistant: null, currentThinking: null, toolCards: new Map(), ctx: { used: 0, window: 200000, windowReported: false, model: "", baseline: 0, system: 0, live: false }, totals: { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 }, usageText: "", compactPin: 0, cur: { model: "default", mode: "default", effort: "none" }, modelReconciled: false };
+    const tab = { id: id, title: title, el: el, running: false, currentTurn: null, currentAssistant: null, currentThinking: null, toolCards: new Map(), ctx: { used: 0, window: 200000, windowReported: false, model: "", baseline: 0, system: 0, live: false }, totals: { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 }, usageText: "", compactPin: 0, cur: { model: "default", mode: "default", effort: "none" }, modelReconciled: false, attachments: [], inputHistory: [], histIndex: -1, histDraft: "", stickBottom: true, savedTop: 0, thinkingVisible: true };
     tabs.set(id, tab);
     return tab;
   }
@@ -52,6 +52,10 @@
       old.usageText = els.usage.textContent; old.compactPin = compactPin;
       old.cur = Object.assign({}, cur);
       old.inputDraft = els.input.value;
+      old.attachments = attachments.slice();
+      old.inputHistory = inputHistory.slice(); old.histIndex = histIndex; old.histDraft = histDraft;
+      old.stickBottom = stickBottom; old.savedTop = savedTop;
+      old.thinkingVisible = thinkingVisible;
       old.el.style.display = "none";
     }
     activeTabId = newId;
@@ -62,7 +66,11 @@
     els.usage.textContent = nw.usageText || ""; compactPin = nw.compactPin || 0;
     Object.assign(cur, nw.cur || { model: "default", mode: "default", effort: "none" });
     els.input.value = nw.inputDraft || "";
-    syncUI(); autoGrow();
+    attachments = (nw.attachments || []).slice();
+    inputHistory = (nw.inputHistory || []).slice(); histIndex = nw.histIndex != null ? nw.histIndex : -1; histDraft = nw.histDraft || "";
+    stickBottom = nw.stickBottom != null ? nw.stickBottom : true; savedTop = nw.savedTop || 0;
+    thinkingVisible = nw.thinkingVisible != null ? nw.thinkingVisible : true; applyThinkingVisibility();
+    syncUI(); autoGrow(); renderAttachments();
     nw.el.style.display = "";
     els.sendBtn.classList.toggle("hidden", running);
     els.stopBtn.classList.toggle("hidden", !running);
@@ -297,6 +305,12 @@
   function summarize(name, input) {
     try {
       if (!input) return "";
+      if ((name === "TodoWrite" || name === "TodoRead") && Array.isArray(input.todos)) {
+        const total = input.todos.length;
+        const done = input.todos.filter((x) => x.status === "completed").length;
+        const active = input.todos.filter((x) => x.status === "in_progress").length;
+        return total + " task" + (total !== 1 ? "s" : "") + (active ? ", " + active + " active" : "") + (done ? ", " + done + " done" : "");
+      }
       const s = input.command || input.file_path || input.path || input.pattern || input.url ||
         (input.prompt ? String(input.prompt).slice(0, 80) : JSON.stringify(input).slice(0, 80));
       return String(s).length > SUMMARY_MAX ? String(s).slice(0, SUMMARY_MAX) + "…" : String(s);
@@ -304,6 +318,20 @@
     catch (e) { return ""; }
   }
   function isEditTool(name) { return name === "Edit" || name === "Write" || name === "MultiEdit"; }
+  function isTodoTool(name) { return name === "TodoWrite" || name === "TodoRead"; }
+  function todoBody(input) {
+    const todos = (input && Array.isArray(input.todos)) ? input.todos : [];
+    if (!todos.length) return "<pre>" + window.md.esc(JSON.stringify(input || {}, null, 2)) + "</pre>";
+    const rows = todos.map((item) => {
+      const done = item.status === "completed";
+      const active = item.status === "in_progress";
+      const pri = (item.priority || "medium").toLowerCase();
+      const cls = "todo-item" + (done ? " done" : "") + (active ? " active" : "") + " pri-" + pri;
+      const icon = done ? "✓" : active ? "▶" : "○";
+      return '<div class="' + cls + '"><span class="todo-icon">' + icon + '</span><span class="todo-text">' + window.md.esc(item.content || "") + '</span><span class="todo-pri">' + window.md.esc(pri) + '</span></div>';
+    }).join("");
+    return '<div class="todo-list">' + rows + '</div>';
+  }
   // Render an edit as a VS Code-style unified diff: lines the edit leaves alone stay as plain
   // context, only what actually changed gets a red/green band, and within a modified line the
   // changed characters are marked. The old renderer dumped the whole of old_string as removed
@@ -406,10 +434,12 @@
     h.innerHTML = '<span class="tname">' + window.md.esc(t.name || "tool") + '</span>' + summaryHtml + '<span class="chev">▶</span>';
     const bd = document.createElement("div"); bd.className = "tool-body";
     const edit = isEditTool(t.name) && t.input && t.input.file_path;
+    const todo = isTodoTool(t.name);
     if (edit) { bd.innerHTML = diffBody(t.input, t.name); c.classList.add("open"); }  // show edit diffs expanded by default
+    else if (todo) { bd.innerHTML = todoBody(t.input); c.classList.add("open"); }
     else bd.innerHTML = "<pre>" + window.md.esc(JSON.stringify(t.input || {}, null, 2)) + "</pre>";
     if (filePath) {
-      h.querySelector(".fp-link").addEventListener("click", (e) => { e.stopPropagation(); post("openFile", { path: filePath }); });
+      h.querySelector(".fp-link").addEventListener("click", (e) => { e.stopPropagation(); post("openToolFile", { path: filePath }); });
     }
     h.addEventListener("click", () => c.classList.toggle("open"));
     c.appendChild(h); c.appendChild(bd); nd.main.appendChild(c);
@@ -529,13 +559,42 @@
       if (!running) removeThinking();
       renderTabBar();
     },
-    assistantStart: (p) => { if (!isActiveTab(p)) return; removeThinking(); settleThinking(); currentAssistant = null; },
+    assistantStart: (p) => {
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) { bgTab.currentAssistant = null; }
+        return;
+      }
+      removeThinking(); settleThinking(); currentAssistant = null;
+    },
     assistantDelta: (p) => {
-      if (!isActiveTab(p)) return;
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) {
+          if (!bgTab.currentAssistant) {
+            const turn = document.createElement("div"); turn.className = "turn";
+            const node = document.createElement("div"); node.className = "node text-node";
+            const dot = document.createElement("span"); dot.className = "node-dot text";
+            const main = document.createElement("div"); main.className = "node-main";
+            node.appendChild(dot); node.appendChild(main); turn.appendChild(node); bgTab.el.appendChild(turn);
+            bgTab.currentAssistant = { el: main, buf: "" }; bgTab.currentTurn = turn;
+          }
+          bgTab.currentAssistant.buf += p.text || "";
+          bgTab.currentAssistant.el.innerHTML = window.md.render(bgTab.currentAssistant.buf);
+        }
+        return;
+      }
       if (!currentAssistant) { settleThinking(); const n = addNode("text-node", "text"); currentAssistant = { el: n.main, buf: "" }; }
       currentAssistant.buf += p.text || ""; currentAssistant.el.innerHTML = window.md.render(currentAssistant.buf); scrollDown();
     },
-    assistantEnd: (p) => { if (!isActiveTab(p)) return; settleThinking(); currentAssistant = null; },
+    assistantEnd: (p) => {
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) { bgTab.currentAssistant = null; bgTab.currentTurn = null; }
+        return;
+      }
+      settleThinking(); currentAssistant = null;
+    },
     assistant: (p) => { if (!isActiveTab(p)) return; removeThinking(); settleThinking(); const n = addNode("text-node", "text"); renderBlocks(n.main, p.content || []); currentAssistant = null; scrollDown(); },
     thinking: (p) => { if (!isActiveTab(p)) return; showThinking(p.label); },
     thinkingDelta: (p) => { if (!isActiveTab(p)) return; appendThinking(p.text); },
@@ -545,7 +604,16 @@
     permissionResolved: (p) => { if (!isActiveTab(p)) return; resolvePermById(p.id, p.behavior, "(Auto mode)"); },
     // Live context size, one per API request. Authoritative for the ring — see the `result` handler.
     contextUsage: (p) => {
-      if (!isActiveTab(p)) return;
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) {
+          if (!bgTab.ctx) bgTab.ctx = { used: 0, window: 200000, windowReported: false, model: "", baseline: 0, system: 0, live: false };
+          bgTab.ctx.used = +(p.totalTokens || p.promptTokens || 0); bgTab.ctx.live = true;
+          if (!bgTab.ctx.baseline && !(+(p.cacheReadTokens || 0))) bgTab.ctx.baseline = +(p.cacheCreationTokens || 0);
+          bgTab.ctx.system = Math.min(bgTab.ctx.baseline || 0, bgTab.ctx.used);
+        }
+        return;
+      }
       ctx.used = +(p.totalTokens || p.promptTokens || 0);
       ctx.live = true;
       if (!ctx.baseline && !(+(p.cacheReadTokens || 0))) ctx.baseline = +(p.cacheCreationTokens || 0);
@@ -554,7 +622,22 @@
       if (topOpen === "context") renderContext();
     },
     result: (p) => {
-      if (!isActiveTab(p)) return;
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) {
+          if (!bgTab.totals) bgTab.totals = { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 };
+          bgTab.totals.costUsd += +(p.costUsd || 0); bgTab.totals.inputTokens += +(p.inputTokens || 0);
+          bgTab.totals.outputTokens += +(p.outputTokens || 0); bgTab.totals.turns += 1;
+          bgTab.totals.cacheReadTokens += +(p.cacheReadTokens || 0); bgTab.totals.cacheCreationTokens += +(p.cacheCreationTokens || 0);
+          bgTab.usageText = [p.costUsd != null ? "$" + Number(p.costUsd).toFixed(4) : null, p.inputTokens != null ? p.inputTokens + " in" : null, p.outputTokens != null ? p.outputTokens + " out" : null, p.durationMs != null ? (p.durationMs / 1000).toFixed(1) + "s" : null].filter(Boolean).join(" · ");
+          const fd = document.createElement("div"); fd.className = "fork-divider";
+          fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
+          const _keepCount = bgTab.totals.turns * 2;
+          fd.querySelector(".fork-btn").addEventListener("click", () => { post("forkTab", { count: _keepCount }); });
+          bgTab.el.appendChild(fd);
+        }
+        return;
+      }
       const parts = [];
       if (p.costUsd != null) parts.push("$" + Number(p.costUsd).toFixed(4));
       if (p.inputTokens != null) parts.push(p.inputTokens + " in");
@@ -572,9 +655,26 @@
       updateRing();
       if (topOpen === "usage") renderUsage();
       if (topOpen === "context") renderContext();
+      const fd = document.createElement("div"); fd.className = "fork-divider";
+      fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
+      const _keepCount = totals.turns * 2;
+      fd.querySelector(".fork-btn").addEventListener("click", () => {
+        post("forkTab", { count: _keepCount });
+      });
+      (msgRoot() || els.messages).appendChild(fd);
+      scrollDown();
     },
     error: (p) => {
-      if (!isActiveTab(p)) return;
+      if (!isActiveTab(p)) {
+        const bgTab = p.tabId && tabs.get(p.tabId);
+        if (bgTab) {
+          const w = document.createElement("div"); w.className = "msg assistant";
+          const b = document.createElement("div"); b.className = "bubble";
+          b.innerHTML = '<span style="color:var(--red)">⚠ ' + window.md.esc(p.message || "Error") + "</span>";
+          w.appendChild(b); bgTab.el.appendChild(w);
+        }
+        return;
+      }
       removeThinking();
       const msg = p.message || "Error";
       const low = msg.toLowerCase();
@@ -619,12 +719,28 @@
           const msgs = p.messages || [];
           if (msgs.length) {
             const d = document.createElement("div"); d.className = "compacted-divider";
-            d.innerHTML = "<span>Restored previous conversation</span>"; bgTab.el.appendChild(d);
+            d.innerHTML = "<span>" + (p.fork ? "Forked from previous conversation" : "Restored previous conversation") + "</span>"; bgTab.el.appendChild(d);
           }
-          msgs.forEach((m) => {
-            const w = document.createElement("div"); w.className = "msg " + (m.role === "user" ? "user" : "assistant");
-            const b = document.createElement("div"); b.className = "bubble";
-            b.innerHTML = window.md.render(m.text || ""); w.appendChild(b); bgTab.el.appendChild(w);
+          const bgRestoredTurns = msgs.filter(m => m.role === "assistant").length;
+          let bgTurnsSoFar = 0;
+          msgs.forEach((m, i) => {
+            if (m.role === "user") {
+              const w = document.createElement("div"); w.className = "msg user";
+              const b = document.createElement("div"); b.className = "bubble";
+              b.innerHTML = window.md.render(m.text || ""); w.appendChild(b); bgTab.el.appendChild(w);
+            } else {
+              const w = document.createElement("div"); w.className = "msg assistant";
+              const b = document.createElement("div"); b.className = "bubble";
+              b.innerHTML = window.md.render(m.text || ""); w.appendChild(b); bgTab.el.appendChild(w);
+              bgTurnsSoFar++;
+              const fd = document.createElement("div"); fd.className = "fork-divider";
+              fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
+              const _keepCount = bgTurnsSoFar * 2;
+              fd.querySelector(".fork-btn").addEventListener("click", () => {
+                post("forkTab", { count: _keepCount });
+              });
+              bgTab.el.appendChild(fd);
+            }
           });
         }
         return;
@@ -642,11 +758,25 @@
       syncUI();
       ctx.model = ""; updateModelBtn();
       const msgs = p.messages || [];
-      if (msgs.length) { const d = document.createElement("div"); d.className = "compacted-divider"; d.innerHTML = "<span>Restored previous conversation</span>"; root.appendChild(d); }
-      msgs.forEach((m) => {
-        endTurn();
-        if (m.role === "user") { addMsg("user").innerHTML = window.md.render(m.text || ""); }
-        else { const n = addNode("text-node", "text"); n.main.innerHTML = window.md.render(m.text || ""); }
+      if (msgs.length) { const d = document.createElement("div"); d.className = "compacted-divider"; d.innerHTML = "<span>" + (p.fork ? "Forked from previous conversation" : "Restored previous conversation") + "</span>"; root.appendChild(d); }
+      const restoredTurns = msgs.filter(m => m.role === "assistant").length;
+      totals.turns = restoredTurns;
+      let turnsSoFar = 0;
+      msgs.forEach((m, i) => {
+        if (m.role === "user") { endTurn(); addMsg("user").innerHTML = window.md.render(m.text || ""); }
+        else {
+          endTurn();
+          const n = addNode("text-node", "text"); n.main.innerHTML = window.md.render(m.text || "");
+          endTurn();
+          turnsSoFar++;
+          const fd = document.createElement("div"); fd.className = "fork-divider";
+          fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
+          const _keepCount = turnsSoFar * 2;
+          fd.querySelector(".fork-btn").addEventListener("click", () => {
+            post("forkTab", { count: _keepCount });
+          });
+          root.appendChild(fd);
+        }
       });
       endTurn(); scrollDown();
     },
