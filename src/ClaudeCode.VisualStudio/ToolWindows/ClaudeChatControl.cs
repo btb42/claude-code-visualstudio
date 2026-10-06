@@ -116,20 +116,45 @@ namespace ClaudeCode.VisualStudio
             // Remove once the offending shortcut is identified.
             PreviewKeyDown += (s, e) =>
             {
-                var mod = new System.Text.StringBuilder();
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))  mod.Append("Ctrl+");
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt))      mod.Append("Alt+");
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))    mod.Append("Shift+");
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Windows))  mod.Append("Win+");
-                Log.Write("KEY: " + mod + e.Key + " (sys=" + e.SystemKey + ")");
+                var mod = Keyboard.Modifiers;
+                var sb = new System.Text.StringBuilder();
+                if (mod.HasFlag(ModifierKeys.Control)) sb.Append("Ctrl+");
+                if (mod.HasFlag(ModifierKeys.Alt))     sb.Append("Alt+");
+                if (mod.HasFlag(ModifierKeys.Shift))   sb.Append("Shift+");
+                if (mod.HasFlag(ModifierKeys.Windows)) sb.Append("Win+");
+                Log.Write("KEY: " + sb + e.Key + " (sys=" + e.SystemKey + ")");
 
                 // Space reaching WPF means the WebView dropped focus (e.g. after an async
                 // clipboard write). Re-focus the WebView so VS does not interpret it as a
                 // tool-window navigation command, then let the keystroke through — the
                 // document-level keydown handler in app.js will route it to #input.
-                if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None)
+                if (e.Key == Key.Space && mod == ModifierKeys.None)
                 {
                     _webView.Focus();
+                }
+
+                // Text-navigation keys: VS binds End/Home (and sometimes arrow keys) to IDE
+                // document/tab navigation commands.  When WebView2 has focus the key was
+                // already delivered to its Win32 HWND, so the cursor moves correctly.
+                // Marking Handled here only prevents VS from also executing the IDE command
+                // (e.g. End jumping to a different editor tab, mouse cursor disappearing).
+                // Alt-modified keys are let through — those are VS menu accelerators the
+                // user may intentionally want (e.g. Alt+Left = Navigate Back).
+                if ((mod & ModifierKeys.Alt) == ModifierKeys.None)
+                {
+                    switch (e.Key)
+                    {
+                        case Key.Home:
+                        case Key.End:
+                        case Key.Left:
+                        case Key.Right:
+                        case Key.Up:
+                        case Key.Down:
+                        case Key.PageUp:
+                        case Key.PageDown:
+                            e.Handled = true;
+                            break;
+                    }
                 }
             };
 
