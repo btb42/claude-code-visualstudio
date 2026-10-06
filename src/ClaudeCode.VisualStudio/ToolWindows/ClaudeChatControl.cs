@@ -138,23 +138,24 @@ namespace ClaudeCode.VisualStudio
                 // already delivered to its Win32 HWND, so the cursor moves correctly.
                 // Marking Handled here only prevents VS from also executing the IDE command
                 // (e.g. End jumping to a different editor tab, mouse cursor disappearing).
-                // Alt-modified keys are let through — those are VS menu accelerators the
-                // user may intentionally want (e.g. Alt+Left = Navigate Back).
-                if ((mod & ModifierKeys.Alt) == ModifierKeys.None)
+                // Alt+Left/Right are let through — those are VS Navigate Back/Forward.
+                switch (e.Key)
                 {
-                    switch (e.Key)
-                    {
-                        case Key.Home:
-                        case Key.End:
-                        case Key.Left:
-                        case Key.Right:
-                        case Key.Up:
-                        case Key.Down:
-                        case Key.PageUp:
-                        case Key.PageDown:
+                    case Key.Home:
+                    case Key.End:
+                        // Intercept all modifier variants — Alt+End/Alt+Home also jump in VS.
+                        e.Handled = true;
+                        break;
+                    case Key.Left:
+                    case Key.Right:
+                    case Key.Up:
+                    case Key.Down:
+                    case Key.PageUp:
+                    case Key.PageDown:
+                        // Let Alt+Left/Right through for VS Navigate Back/Forward.
+                        if ((mod & ModifierKeys.Alt) == ModifierKeys.None)
                             e.Handled = true;
-                            break;
-                    }
+                        break;
                 }
             };
 
