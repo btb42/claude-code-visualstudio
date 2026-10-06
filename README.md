@@ -1,13 +1,19 @@
 ﻿# Claude Code for Visual Studio
 
-## my changes : 
+> **This is a fork** of [nachum-shmilovitz-66/claude-code-visualstudio](https://github.com/nachum-shmilovitz-66/claude-code-visualstudio).  
+> All original features are preserved. Additional features are listed below.
 
- fork, with some enhancements / reworked.
- mail additional feature - more tabs. 
+## Enhancements in this fork
 
+| Version | Feature |
+|---|---|
+| v1.1.1 | **Tab history** — closed tabs can be reopened with their full conversation transcript |
+| v1.1.1 | **WebView2 memory fix** — browser processes are now properly released when a pane is closed; no more `msedgewebview2.exe` accumulation after opening and closing multiple panels |
+| v1.1.0 | **Multi-tab conversations** — run several Claude sessions side-by-side in one tool window |
+| v1.1.0 | **Fork from any turn** — branch a new tab from any message in the transcript to explore an alternative without losing the original |
+| v1.1.0 | New tab inherits the starred (default) permission mode |
 
-
-> **Latest release:** <!-- managed:version -->v1.0.17<!-- /managed:version --> — [download the VSIX from Releases](https://github.com/nachum-shmilovitz-66/claude-code-visualstudio/releases/latest)
+> **Latest release:** <!-- managed:version -->v1.1.1<!-- /managed:version --> — [download the VSIX from Releases](https://github.com/btb42/claude-code-visualstudio/releases/latest)
 
 Brings the [Claude Code](https://www.anthropic.com/claude-code) agentic coding assistant into
 **Visual Studio 2026, 2022, 2019, and 2017** as a native tool-window chat — the same kind of
@@ -192,7 +198,7 @@ After any change to `settings.json` or `claude mcp add/remove`, restart VS (or u
 
 ### From a release VSIX (recommended)
 1. Download the VSIX for your Visual Studio from the
-   [Releases page](https://github.com/nachum-shmilovitz-66/claude-code-visualstudio/releases/latest):
+   [Releases page](https://github.com/btb42/claude-code-visualstudio/releases/latest):
    - `ClaudeCode.VisualStudio-vs2022-2026.vsix` — VS 2022 / 2026 (amd64)
    - `ClaudeCode.VisualStudio-vs2019.vsix` — VS 2019 (16.x, x86)
    - `ClaudeCode.VisualStudio-vs2017.vsix` — VS 2017 15.7+ (15.x, x86)
