@@ -85,6 +85,7 @@ namespace ClaudeCode.VisualStudio
         private DateTime _lastCliCheckUtc = DateTime.MinValue;   // when that check last completed
         private bool _disposed;
         private Action<Dictionary<string, string>> _themeChangedHandler;
+        private Window _hostWindow;
 
         // Working directory for claude. Defaults to the user profile and is upgraded to the
         // solution directory once known. Cached so the send path never blocks on VS services.
@@ -158,6 +159,12 @@ namespace ClaudeCode.VisualStudio
             _host.MessageReceived -= OnMessageReceived;
             _theme.ThemeChanged -= _themeChangedHandler;
             _debug.Break -= OnDebugBreak;
+
+            if (_hostWindow != null)
+            {
+                _hostWindow.Activated -= OnHostWindowActivated;
+                _hostWindow = null;
+            }
 
             var timer = System.Threading.Interlocked.Exchange(ref _cliCheckTimer, null);
             timer?.Dispose();
@@ -247,6 +254,32 @@ namespace ClaudeCode.VisualStudio
             // One consolidated report, written long after everything above has settled — see Perf.
             // 90s: long enough to still catch the deliberately deferred command refresh below.
             Perf.FlushSoon(90000);
+
+            // WebView2 DPI fix: on multi-monitor setups the control may render at the wrong scale
+            // after a window restore or focus switch.  Subscribing to Activated forces a layout
+            // cycle each time the VS window comes back, which re-queries the correct monitor DPI.
+            try
+            {
+                var window = Window.GetWindow(this);
+                if (window != null)
+                {
+                    _hostWindow = window;
+                    window.Activated += OnHostWindowActivated;
+                }
+            }
+            catch { }
+        }
+
+        private void OnHostWindowActivated(object sender, EventArgs e)
+        {
+            // WebView2 DPI bug on multi-monitor: after a window restore or focus switch,
+            // WebView2 may render at the wrong scale (blurry/zoomed).  Nudging the margin
+            // by 1px forces WPF to call ArrangeOverride, which makes WebView2 re-query the
+            // current monitor DPI.  The nudge is one render frame — visually invisible.
+            _webView.Margin = new Thickness(0, 0, 0, 1);
+            _webView.Dispatcher.InvokeAsync(
+                () => _webView.Margin = new Thickness(0),
+                System.Windows.Threading.DispatcherPriority.Render);
         }
 
         // The debugger paused (breakpoint / step / thrown exception). Surface it in the
