@@ -39,6 +39,13 @@ namespace ClaudeCode.VisualStudio
                 BitmapImageMoniker = KnownMonikers.CommentSparkle;
 #endif
             }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing && Content is IDisposable disposable)
+                    disposable.Dispose();
+                base.Dispose(disposing);
+            }
         }
     }
 }

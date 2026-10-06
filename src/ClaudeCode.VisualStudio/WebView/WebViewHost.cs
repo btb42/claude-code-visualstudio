@@ -20,13 +20,20 @@ namespace ClaudeCode.VisualStudio.WebView
     /// Wraps a <see cref="WebView2"/> control: boots the runtime, serves the bundled
     /// chat UI from a virtual host, and brokers JSON messages both directions.
     /// </summary>
-    public sealed class WebViewHost
+    public sealed class WebViewHost : IDisposable
     {
         private const string VirtualHost = "claudecode.local";
 
         private readonly WebView2 _webView;
         private readonly Dispatcher _dispatcher;
         private bool _initialized;
+        private bool _disposed;
+
+        // Stored delegates so they can be unsubscribed in Dispose.
+        private CoreWebView2 _core;
+        private EventHandler<CoreWebView2WebMessageReceivedEventArgs> _webMessageHandler;
+        private EventHandler<CoreWebView2NewWindowRequestedEventArgs> _newWindowHandler;
+        private EventHandler<CoreWebView2NavigationStartingEventArgs> _navigationHandler;
 
         /// <summary>Raised on the UI thread for every message the WebView posts to us.</summary>
         public event Action<WebMessage> MessageReceived;
@@ -85,6 +92,7 @@ namespace ClaudeCode.VisualStudio.WebView
             Services.Perf.Step("webview: EnsureCoreWebView2Async", t);
 
             var core = _webView.CoreWebView2;
+            _core = core;
             var settings = core.Settings;
             // Security: DevTools exposes the host<->WebView message protocol and in-memory data.
             // Enable only in Debug builds.
@@ -98,17 +106,18 @@ namespace ClaudeCode.VisualStudio.WebView
             settings.AreBrowserAcceleratorKeysEnabled = false;
             settings.IsZoomControlEnabled = false;
 
-            core.WebMessageReceived += OnWebMessageReceived;
+            _webMessageHandler = OnWebMessageReceived;
+            core.WebMessageReceived += _webMessageHandler;
 
             // Security: keep the WebView pinned to our local UI. A target="_blank" link opens a
             // NewWindowRequested; any attempt to navigate the frame elsewhere is cancelled. Real
             // web URLs are handed to the system browser instead of loading inside the control.
-            core.NewWindowRequested += (s, e) =>
+            _newWindowHandler = (s, e) =>
             {
                 e.Handled = true;
                 OpenInBrowser(e.Uri);
             };
-            core.NavigationStarting += (s, e) =>
+            _navigationHandler = (s, e) =>
             {
                 if (e.Uri != null &&
                     !e.Uri.StartsWith("https://" + VirtualHost, StringComparison.OrdinalIgnoreCase))
@@ -117,6 +126,8 @@ namespace ClaudeCode.VisualStudio.WebView
                     OpenInBrowser(e.Uri);
                 }
             };
+            core.NewWindowRequested += _newWindowHandler;
+            core.NavigationStarting += _navigationHandler;
 
             var mediaPath = Path.Combine(
                 Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? string.Empty,
@@ -138,6 +149,26 @@ namespace ClaudeCode.VisualStudio.WebView
             Services.Perf.Mark("webview: navigate issued");
 
             Ready?.Invoke();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_core != null)
+            {
+                try
+                {
+                    _core.WebMessageReceived -= _webMessageHandler;
+                    _core.NewWindowRequested -= _newWindowHandler;
+                    _core.NavigationStarting -= _navigationHandler;
+                }
+                catch { }
+                _core = null;
+            }
+
+            try { _webView.Dispose(); } catch { }
         }
 
         private void OnWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)

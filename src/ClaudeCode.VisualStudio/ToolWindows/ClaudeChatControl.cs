@@ -19,7 +19,7 @@ namespace ClaudeCode.VisualStudio
     /// Chat tool window content: a WebView2 hosting the Claude Code chat UI, wired to a
     /// <see cref="ClaudeSession"/> that drives the real <c>claude</c> CLI.
     /// </summary>
-    public class ClaudeChatControl : UserControl
+    public class ClaudeChatControl : UserControl, IDisposable
     {
         private readonly WebView2 _webView;
         private readonly WebViewHost _host;
@@ -33,6 +33,8 @@ namespace ClaudeCode.VisualStudio
             public string PermissionMode = "default";
             public string Effort = "none";
             public bool ShowThinking = true;
+            public int ForkWindowSize = 6;
+            public bool ForkAllMessages = false;
             public ClaudeSession Session;
             public SessionRecord Record;
             public string LastSentText;
@@ -64,12 +66,16 @@ namespace ClaudeCode.VisualStudio
         private string _permissionMode { get => ActiveTab?.PermissionMode ?? "default"; set { if (ActiveTab != null) ActiveTab.PermissionMode = value; } }
         private string _effort { get => ActiveTab?.Effort ?? "none"; set { if (ActiveTab != null) ActiveTab.Effort = value; } }
         private bool _showThinking { get => ActiveTab?.ShowThinking ?? true; set { if (ActiveTab != null) ActiveTab.ShowThinking = value; } }
+        private int _forkWindowSize { get => ActiveTab?.ForkWindowSize ?? 6; set { if (ActiveTab != null) ActiveTab.ForkWindowSize = value; } }
+        private bool _forkAllMessages { get => ActiveTab?.ForkAllMessages ?? false; set { if (ActiveTab != null) ActiveTab.ForkAllMessages = value; } }
 
         private readonly IdeContextService _ide = new IdeContextService();
         private readonly DebugContextService _debug = new DebugContextService();
         private readonly ThemeService _theme = new ThemeService();
 
         private sealed class EditSnapshot { public string Path; public string OldText; }
+        private readonly System.Collections.Generic.List<SessionRecord> _closedTabHistory = new System.Collections.Generic.List<SessionRecord>();
+        private const int MaxClosedTabHistory = 10;
         private List<string> _tools = new List<string>();
         private List<string> _mcpServers = new List<string>();
         private bool _solutionHooked;         // subscribed to solution-load events (restore retry)
@@ -77,6 +83,8 @@ namespace ClaudeCode.VisualStudio
         private bool _updateRunning;          // a background `claude update` process is in flight
         private System.Threading.Timer _cliCheckTimer;   // hourly re-check for a newer CLI
         private DateTime _lastCliCheckUtc = DateTime.MinValue;   // when that check last completed
+        private bool _disposed;
+        private Action<Dictionary<string, string>> _themeChangedHandler;
 
         // Working directory for claude. Defaults to the user profile and is upgraded to the
         // solution directory once known. Cached so the send path never blocks on VS services.
@@ -94,7 +102,8 @@ namespace ClaudeCode.VisualStudio
 
             _host = new WebViewHost(_webView);
             _host.MessageReceived += OnMessageReceived;
-            _theme.ThemeChanged += vars => _host.PostMessage("theme", vars);
+            _themeChangedHandler = vars => _host.PostMessage("theme", vars);
+            _theme.ThemeChanged += _themeChangedHandler;
 
             // Create the initial tab before any message can arrive.
             _nextTabIndex = 1;
@@ -139,6 +148,25 @@ namespace ClaudeCode.VisualStudio
                 // of all "stops responding" issues: the CLI was killed every time the user looked away.
                 // Sessions are cleaned up when the user explicitly closes/resets them, or when VS exits.
             };
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            _host.MessageReceived -= OnMessageReceived;
+            _theme.ThemeChanged -= _themeChangedHandler;
+            _debug.Break -= OnDebugBreak;
+
+            var timer = System.Threading.Interlocked.Exchange(ref _cliCheckTimer, null);
+            timer?.Dispose();
+
+            foreach (var tab in _tabs.Values)
+                tab.Session?.Dispose();
+            _tabs.Clear();
+
+            _host.Dispose();
         }
 
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "VSTHRD100:Avoid async void methods", Justification = "Event handler")]
@@ -266,16 +294,22 @@ namespace ClaudeCode.VisualStudio
                     ResetSession();
                     break;
                 case "newTab":
-                    HandleNewTab(GetStr(message.Payload, "defaultModel"), GetStr(message.Payload, "defaultMode"));
+                    HandleNewTab(GetStr(message.Payload, "defaultModel"), GetStr(message.Payload, "defaultMode"), GetStr(message.Payload, "defaultEffort"));
                     break;
                 case "forkTab":
-                    HandleForkTab(GetInt(message.Payload, "count", 6));
+                    HandleForkTab(GetStr(message.Payload, "msgId"));
                     break;
                 case "switchTab":
                     HandleSwitchTab(GetStr(message.Payload, "tabId"));
                     break;
                 case "closeTab":
                     HandleCloseTab(GetStr(message.Payload, "tabId"));
+                    break;
+                case "reopenLastTab":
+                    HandleReopenLastTab(GetStr(message.Payload, "tabId"));
+                    break;
+                case "renameTab":
+                    HandleRenameTab(GetStr(message.Payload, "tabId"), GetStr(message.Payload, "newTitle"));
                     break;
                 case "setModel":
                     _model = InputValidation.SanitizeModel(GetStr(message.Payload, "model"), "default");
@@ -298,6 +332,14 @@ namespace ClaudeCode.VisualStudio
                     break;
                 case "setShowThinking":
                     _showThinking = GetBool(message.Payload, "on", true);
+                    SaveOptions();
+                    break;
+                case "setForkWindowSize":
+                    _forkWindowSize = Math.Max(1, Math.Min(200, GetInt(message.Payload, "size", 6)));
+                    SaveOptions();
+                    break;
+                case "setForkAllMessages":
+                    _forkAllMessages = GetBool(message.Payload, "on", false);
                     SaveOptions();
                     break;
                 case "getContext":
@@ -1516,6 +1558,8 @@ namespace ClaudeCode.VisualStudio
                 effort = _effort,
                 permissionMode = _permissionMode,
                 showThinking = _showThinking,
+                forkWindowSize = _forkWindowSize,
+                forkAllMessages = _forkAllMessages,
                 // Laid out like the VS Code panel: each row reads "<model> · <what it is for>",
                 // with an explicit Opus row alongside Default. These are the hardcoded fallback
                 // rows (CLI aliases, no version numbers); the list the CLI itself reports — with
@@ -1579,9 +1623,26 @@ namespace ClaudeCode.VisualStudio
             if (_tabs.Values.Any(t => t.Record != null || t.Session != null)) return;
 
             var bundle = SessionStore.LoadBundle(_cwd);
-            if (bundle == null || bundle.Tabs == null || bundle.Tabs.Count == 0)
+            if (bundle == null)
             {
                 Log.Write("restore: no stored bundle for cwd=" + _cwd);
+                return;
+            }
+
+            // Restore closed-tab history first — even when there are no open tabs to restore,
+            // the reopen button must appear if the user closed a tab while a fresh empty tab
+            // remained (empty tabs have no Record so SaveAllTabs produces Tabs=[]).
+            if (bundle.ClosedTabs != null && bundle.ClosedTabs.Count > 0)
+            {
+                _closedTabHistory.AddRange(bundle.ClosedTabs);
+                if (_closedTabHistory.Count > MaxClosedTabHistory)
+                    _closedTabHistory.RemoveRange(MaxClosedTabHistory, _closedTabHistory.Count - MaxClosedTabHistory);
+                _host.PostMessage("closedTabHistoryChanged", BuildClosedTabsPayload());
+            }
+
+            if (bundle.Tabs == null || bundle.Tabs.Count == 0)
+            {
+                Log.Write("restore: no open tabs in bundle for cwd=" + _cwd);
                 return;
             }
 
@@ -1622,6 +1683,8 @@ namespace ClaudeCode.VisualStudio
                 tab.PermissionMode = InputValidation.SanitizeChoice(rec.Mode, InputValidation.AllowedModes, "default");
                 tab.Effort = InputValidation.SanitizeChoice(rec.Effort, InputValidation.AllowedEfforts, "none");
                 tab.ShowThinking = rec.ShowThinking;
+                tab.ForkWindowSize = rec.ForkWindowSize > 0 ? rec.ForkWindowSize : 6;
+                tab.ForkAllMessages = rec.ForkAllMessages;
                 bool hasMsgs = rec.Messages != null && rec.Messages.Count > 0;
                 if (hasMsgs && !string.IsNullOrEmpty(rec.SessionId)) tab.PendingResumeId = rec.SessionId;
 
@@ -1639,6 +1702,8 @@ namespace ClaudeCode.VisualStudio
                     mode = tab.PermissionMode,
                     effort = tab.Effort,
                     showThinking = tab.ShowThinking,
+                    forkWindowSize = tab.ForkWindowSize,
+                    forkAllMessages = tab.ForkAllMessages,
                 });
             }
 
@@ -1650,7 +1715,12 @@ namespace ClaudeCode.VisualStudio
             }
 
             // Ensure new tabs get indices above the restored ones.
-            _nextTabIndex = Math.Max(_nextTabIndex, _tabs.Count);
+            foreach (var key in _tabs.Keys)
+            {
+                if (key.StartsWith("t") && int.TryParse(key.Substring(1), out var n))
+                    _nextTabIndex = Math.Max(_nextTabIndex, n);
+            }
+
         }
 
         /// <summary>
@@ -1968,6 +2038,10 @@ namespace ClaudeCode.VisualStudio
             });
             s.Result += r =>
             {
+                var newMsgId = (!tab.Compacting && !r.IsError)
+                    ? AppendHistoryForTab(tab, "assistant", r.Text)
+                    : null;
+                tab.Compacting = false;
                 _host.PostMessage("result", new
                 {
                     tabId = tab.TabId,
@@ -1979,12 +2053,9 @@ namespace ClaudeCode.VisualStudio
                     contextWindow = r.ContextWindow,
                     model = r.Model,
                     durationMs = r.DurationMs,
+                    msgId = newMsgId,
                 });
                 _host.PostMessage("status", new { tabId = tab.TabId, state = "idle" });
-
-                if (!tab.Compacting && !r.IsError)
-                    AppendHistoryForTab(tab, "assistant", r.Text);
-                tab.Compacting = false;
             };
             s.Compacted += c => _host.PostMessage("compacted", new
             {
@@ -2406,9 +2477,9 @@ namespace ClaudeCode.VisualStudio
         }
 
         private void AppendHistory(string role, string text) => AppendHistoryForTab(ActiveTab, role, text);
-        private void AppendHistoryForTab(TabState tab, string role, string text)
+        private string AppendHistoryForTab(TabState tab, string role, string text)
         {
-            if (tab == null) return;
+            if (tab == null) return null;
             try
             {
                 if (tab.Record == null) tab.Record = new SessionRecord { TabId = tab.TabId };
@@ -2420,15 +2491,19 @@ namespace ClaudeCode.VisualStudio
                 }
                 tab.Record.TabId = tab.TabId;
                 tab.Record.TabTitle = tab.Title;
-                tab.Record.Messages.Add(new StoredMessage { Role = role, Text = text ?? string.Empty });
+                var msgId = role == "assistant" ? Guid.NewGuid().ToString("N").Substring(0, 8) : null;
+                tab.Record.Messages.Add(new StoredMessage { Role = role, Text = text ?? string.Empty, Id = msgId });
                 tab.Record.SessionId = tab.Session?.SessionId ?? tab.Record.SessionId;
                 tab.Record.Model = tab.Model;
                 tab.Record.Mode = tab.PermissionMode;
                 tab.Record.Effort = tab.Effort;
                 tab.Record.ShowThinking = tab.ShowThinking;
+                tab.Record.ForkWindowSize = tab.ForkWindowSize;
+                tab.Record.ForkAllMessages = tab.ForkAllMessages;
                 SaveAllTabs();
+                return msgId;
             }
-            catch { }
+            catch { return null; }
         }
 
         // Persist the current composer options (model / permission mode / effort / show-thinking)
@@ -2457,6 +2532,8 @@ namespace ClaudeCode.VisualStudio
                 tab.Record.Mode = tab.PermissionMode;
                 tab.Record.Effort = tab.Effort;
                 tab.Record.ShowThinking = tab.ShowThinking;
+                tab.Record.ForkWindowSize = tab.ForkWindowSize;
+                tab.Record.ForkAllMessages = tab.ForkAllMessages;
                 SaveAllTabs();
             }
             catch { }
@@ -2474,6 +2551,7 @@ namespace ClaudeCode.VisualStudio
                     if (tab.Title != null) tab.Record.TabTitle = tab.Title;
                     bundle.Tabs.Add(tab.Record);
                 }
+                bundle.ClosedTabs = new System.Collections.Generic.List<SessionRecord>(_closedTabHistory);
                 SessionStore.SaveBundle(_cwd, bundle);
             }
             catch { }
@@ -2576,47 +2654,67 @@ namespace ClaudeCode.VisualStudio
         }
 
         // ── Tab management ───────────────────────────────────────────────────────────
-        private void HandleNewTab(string defaultModel = null, string defaultMode = null)
+        private static string NewTabId() => "t" + Guid.NewGuid().ToString("N").Substring(0, 10);
+
+        private void HandleNewTab(string defaultModel = null, string defaultMode = null, string defaultEffort = null)
         {
-            var id = "t" + (++_nextTabIndex);
+            var id = NewTabId();
+            var label = "Chat " + (++_nextTabIndex);
             Log.Write("HandleNewTab: creating " + id + " (prev active=" + _activeTabId + ")");
             var tab = new TabState(id);
             if (!string.IsNullOrEmpty(defaultModel))
                 tab.Model = InputValidation.SanitizeModel(defaultModel, "default");
             if (!string.IsNullOrEmpty(defaultMode))
                 tab.PermissionMode = InputValidation.SanitizeChoice(defaultMode, InputValidation.AllowedModes, "default");
+            if (!string.IsNullOrEmpty(defaultEffort))
+                tab.Effort = InputValidation.SanitizeChoice(defaultEffort, InputValidation.AllowedEfforts, "none");
             _tabs[id] = tab;
-            _host.PostMessage("tabCreated", new { tabId = id, title = "Chat " + _nextTabIndex, active = false, model = tab.Model, mode = tab.PermissionMode });
+            _host.PostMessage("tabCreated", new { tabId = id, title = label, active = false, model = tab.Model, mode = tab.PermissionMode });
             _activeTabId = id;
             _host.PostMessage("tabSwitched", new { tabId = id });
             Log.Write("HandleNewTab: done, activeTabId=" + _activeTabId);
         }
 
-        private void HandleForkTab(int messageCount)
+        private void HandleForkTab(string msgId)
         {
             _tabs.TryGetValue(_activeTabId, out var sourceTab);
             var sourceMsgs = sourceTab?.Record?.Messages ?? new System.Collections.Generic.List<StoredMessage>();
-            var keep = Math.Min(messageCount, sourceMsgs.Count);
-            var lastMsgs = keep > 0 ? sourceMsgs.GetRange(0, keep) : new System.Collections.Generic.List<StoredMessage>();
 
-            var id = "t" + (++_nextTabIndex);
-            Log.Write("HandleForkTab: creating " + id + " from " + _activeTabId + " msgs=" + lastMsgs.Count);
+            // Find the clicked assistant message by its ID, fall back to last message.
+            var idx = string.IsNullOrEmpty(msgId)
+                ? sourceMsgs.Count - 1
+                : sourceMsgs.FindLastIndex(m => m.Id == msgId);
+            if (idx < 0) idx = sourceMsgs.Count - 1;
+
+            // Take up to N messages ending at idx (inclusive); N comes from the tab's fork setting.
+            var forkWindow = _forkAllMessages ? int.MaxValue : Math.Max(1, _forkWindowSize);
+            var start = Math.Max(0, idx - forkWindow + 1);
+            var count = idx - start + 1;
+            var lastMsgs = count > 0 ? sourceMsgs.GetRange(start, count) : new System.Collections.Generic.List<StoredMessage>();
+
+            var id = NewTabId();
+            var label = "Fork " + (++_nextTabIndex);
+            Log.Write("HandleForkTab: creating " + id + " from " + _activeTabId + " msgs=" + lastMsgs.Count + " (idx=" + idx + " start=" + start + ")");
             var tab = new TabState(id);
-            if (sourceTab != null) { tab.Model = sourceTab.Model; tab.PermissionMode = sourceTab.PermissionMode; }
+            if (sourceTab != null) { tab.Model = sourceTab.Model; tab.PermissionMode = sourceTab.PermissionMode; tab.Effort = sourceTab.Effort; tab.ShowThinking = sourceTab.ShowThinking; tab.ForkWindowSize = sourceTab.ForkWindowSize; tab.ForkAllMessages = sourceTab.ForkAllMessages; }
             tab.Record = new SessionRecord
             {
                 TabId = id,
-                TabTitle = "Fork " + _nextTabIndex,
+                TabTitle = label,
                 Model = tab.Model,
                 Mode = tab.PermissionMode,
+                Effort = tab.Effort,
+                ShowThinking = tab.ShowThinking,
+                ForkWindowSize = tab.ForkWindowSize,
+                ForkAllMessages = tab.ForkAllMessages,
                 Messages = new System.Collections.Generic.List<StoredMessage>(lastMsgs)
             };
             _tabs[id] = tab;
-            _host.PostMessage("tabCreated", new { tabId = id, title = "Fork " + _nextTabIndex, active = false, model = tab.Model, mode = tab.PermissionMode });
+            _host.PostMessage("tabCreated", new { tabId = id, title = label, active = false, model = tab.Model, mode = tab.PermissionMode });
             _activeTabId = id;
             _host.PostMessage("tabSwitched", new { tabId = id });
             if (lastMsgs.Count > 0)
-                _host.PostMessage("restore", new { tabId = id, fork = true, model = tab.Model, mode = tab.PermissionMode, messages = System.Linq.Enumerable.Select(lastMsgs, m => new { role = m.Role, text = m.Text }).ToArray() });
+                _host.PostMessage("restore", new { tabId = id, fork = true, model = tab.Model, mode = tab.PermissionMode, effort = tab.Effort, showThinking = tab.ShowThinking, forkWindowSize = tab.ForkWindowSize, forkAllMessages = tab.ForkAllMessages, messages = System.Linq.Enumerable.Select(lastMsgs, m => new { role = m.Role, text = m.Text, id = m.Id }).ToArray() });
             SaveAllTabs();
         }
 
@@ -2629,10 +2727,32 @@ namespace ClaudeCode.VisualStudio
             SaveAllTabs();
         }
 
+        private void HandleRenameTab(string tabId, string newTitle)
+        {
+            if (tabId == null || !_tabs.TryGetValue(tabId, out var tab)) return;
+            newTitle = (newTitle ?? "").Trim();
+            if (newTitle.Length == 0) return;
+            if (newTitle.Length > 60) newTitle = newTitle.Substring(0, 60);
+            tab.Title = newTitle;
+            if (tab.Record == null) tab.Record = new SessionRecord { TabId = tab.TabId };
+            tab.Record.TabTitle = newTitle;
+            _host.PostMessage("updateTabTitle", new { tabId = tab.TabId, title = newTitle });
+            SaveAllTabs();
+        }
+
         private void HandleCloseTab(string tabId)
         {
             if (tabId == null || !_tabs.TryGetValue(tabId, out var tab)) return;
             if (_tabs.Count <= 1) return; // always keep at least one tab
+            // Save snapshot to history before disposing so the user can reopen it.
+            var recToSave = tab.Record;
+            if (recToSave != null && recToSave.Messages?.Count > 0)
+            {
+                recToSave.ClosedAt = DateTime.UtcNow.ToString("O");
+                _closedTabHistory.Insert(0, recToSave);
+                if (_closedTabHistory.Count > MaxClosedTabHistory)
+                    _closedTabHistory.RemoveRange(MaxClosedTabHistory, _closedTabHistory.Count - MaxClosedTabHistory);
+            }
             tab.Session?.Dispose();
             _tabs.Remove(tabId);
             SessionStore.ClearTab(_cwd, tabId);
@@ -2642,7 +2762,66 @@ namespace ClaudeCode.VisualStudio
                 _host.PostMessage("tabSwitched", new { tabId = _activeTabId });
             }
             _host.PostMessage("tabClosed", new { tabId = tabId });
+            _host.PostMessage("closedTabHistoryChanged", BuildClosedTabsPayload());
             SaveAllTabs();
+        }
+
+        private void HandleReopenLastTab(string tabId = null)
+        {
+            int idx = tabId != null
+                ? _closedTabHistory.FindIndex(r => r.TabId == tabId)
+                : 0;
+            if (idx < 0 || _closedTabHistory.Count == 0) return;
+            var rec = _closedTabHistory[idx];
+            _closedTabHistory.RemoveAt(idx);
+            _host.PostMessage("closedTabHistoryChanged", BuildClosedTabsPayload());
+
+            var id = NewTabId();
+            var label = rec.TabTitle ?? ("Chat " + (++_nextTabIndex));
+            var tab = new TabState(id)
+            {
+                Model = rec.Model ?? "default",
+                PermissionMode = rec.Mode ?? "default",
+                Effort = rec.Effort ?? "none",
+                ShowThinking = rec.ShowThinking,
+                ForkWindowSize = rec.ForkWindowSize,
+                ForkAllMessages = rec.ForkAllMessages,
+            };
+            tab.Record = new SessionRecord
+            {
+                TabId = id,
+                TabTitle = label,
+                Model = tab.Model,
+                Mode = tab.PermissionMode,
+                Effort = tab.Effort,
+                ShowThinking = tab.ShowThinking,
+                ForkWindowSize = tab.ForkWindowSize,
+                ForkAllMessages = tab.ForkAllMessages,
+                Messages = new System.Collections.Generic.List<StoredMessage>(rec.Messages ?? new System.Collections.Generic.List<StoredMessage>()),
+            };
+            _tabs[id] = tab;
+            _host.PostMessage("tabCreated", new { tabId = id, title = label, active = false, model = tab.Model, mode = tab.PermissionMode });
+            _activeTabId = id;
+            _host.PostMessage("tabSwitched", new { tabId = id });
+            var msgs = tab.Record.Messages;
+            if (msgs.Count > 0)
+                _host.PostMessage("restore", new { tabId = id, fork = false, model = tab.Model, mode = tab.PermissionMode, effort = tab.Effort, showThinking = tab.ShowThinking, forkWindowSize = tab.ForkWindowSize, forkAllMessages = tab.ForkAllMessages, messages = System.Linq.Enumerable.Select(msgs, m => new { role = m.Role, text = m.Text, id = m.Id }).ToArray() });
+            SaveAllTabs();
+        }
+        private object BuildClosedTabsPayload()
+        {
+            var items = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(_closedTabHistory, r =>
+            {
+                var firstUser = r.Messages?.Find(m => m.Role == "user")?.Text ?? "";
+                if (firstUser.Length > 100) firstUser = firstUser.Substring(0, 100);
+                var lastAssist = "";
+                if (r.Messages != null)
+                    for (int i = r.Messages.Count - 1; i >= 0; i--)
+                        if (r.Messages[i].Role == "assistant") { lastAssist = r.Messages[i].Text ?? ""; break; }
+                if (lastAssist.Length > 100) lastAssist = lastAssist.Substring(0, 100);
+                return new { tabId = r.TabId ?? "", title = r.TabTitle ?? "Chat", closedAt = r.ClosedAt ?? "", firstUser, lastAssist };
+            }));
+            return new { count = _closedTabHistory.Count, tabs = items };
         }
         // ── end tab management ────────────────────────────────────────────────────────
     }

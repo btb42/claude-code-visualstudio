@@ -11,6 +11,7 @@
     modeBtn: $("modeBtn"), modeLabel: $("modeLabel"),
     statusText: $("statusText"), usage: $("usage"), attachments: $("attachments"),
     popover: $("popover"), cpop: $("cpop"), setupBanner: $("setupBanner"),
+    tabpop: $("tabpop"),
   };
 
   let running = false, currentAssistant = null, currentTurn = null, currentThinking = null;
@@ -19,6 +20,11 @@
   // ── Tab management ─────────────────────────────────────────────────────────
   const tabs = new Map();   // tabId → { id, title, el, running, currentTurn, currentAssistant, currentThinking, toolCards }
   let activeTabId = null;
+  let closedTabCount = 0;
+  let closedTabList = [];
+  let tabPopOpen = false;
+  let closedTabPage = 0;
+  const CLOSED_TAB_PAGE_SIZE = 5;
 
   function msgRoot() {
     const t = tabs.get(activeTabId);
@@ -56,6 +62,7 @@
       old.inputHistory = inputHistory.slice(); old.histIndex = histIndex; old.histDraft = histDraft;
       old.stickBottom = stickBottom; old.savedTop = savedTop;
       old.thinkingVisible = thinkingVisible;
+      old.forkWindowSize = forkWindowSize; old.forkAllMessages = forkAllMessages;
       old.el.style.display = "none";
     }
     activeTabId = newId;
@@ -70,6 +77,7 @@
     inputHistory = (nw.inputHistory || []).slice(); histIndex = nw.histIndex != null ? nw.histIndex : -1; histDraft = nw.histDraft || "";
     stickBottom = nw.stickBottom != null ? nw.stickBottom : true; savedTop = nw.savedTop || 0;
     thinkingVisible = nw.thinkingVisible != null ? nw.thinkingVisible : true; applyThinkingVisibility();
+    forkWindowSize = nw.forkWindowSize != null ? nw.forkWindowSize : 6; forkAllMessages = nw.forkAllMessages != null ? nw.forkAllMessages : false;
     syncUI(); autoGrow(); renderAttachments();
     nw.el.style.display = "";
     els.sendBtn.classList.toggle("hidden", running);
@@ -95,6 +103,8 @@
         + '</button>';
     });
     html += '<button class="tab-new" title="New conversation">+</button>';
+    if (closedTabCount > 0)
+      html += '<button class="tab-reopen" title="Recently closed tabs">⟲</button>';
     bar.innerHTML = html;
     bar.querySelectorAll(".tab-btn[data-tab]").forEach(function(btn) {
       btn.addEventListener("click", function(e) {
@@ -104,6 +114,11 @@
       btn.addEventListener("mouseup", function(e) {
         if (e.button === 1) { e.preventDefault(); post("closeTab", { tabId: btn.dataset.tab }); }
       });
+      btn.addEventListener("dblclick", function(e) {
+        if (e.target.classList.contains("tab-close") || e.target.dataset.close) return;
+        e.stopPropagation();
+        startTabRename(btn.dataset.tab);
+      });
     });
     bar.querySelectorAll(".tab-close[data-close]").forEach(function(btn) {
       btn.addEventListener("click", function(e) {
@@ -112,7 +127,110 @@
       });
     });
     const nb = bar.querySelector(".tab-new");
-    if (nb) nb.addEventListener("click", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode() }); });
+    if (nb) nb.addEventListener("click", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode(), defaultEffort: getDefaultEffort() }); });
+    const rb = bar.querySelector(".tab-reopen");
+    if (rb) rb.addEventListener("click", function(e) { e.stopPropagation(); tabPopOpen ? closeTabPop() : openTabPop(); });
+  }
+  function startTabRename(tabId) {
+    const tabObj = tabs.get(tabId);
+    if (!tabObj) return;
+    const btn = document.querySelector('.tab-btn[data-tab="' + tabId + '"]');
+    if (!btn) return;
+    const titleSpan = btn.querySelector(".tab-title");
+    if (!titleSpan) return;
+    const current = tabObj.title || "";
+    const input = document.createElement("input");
+    input.className = "tab-rename-input";
+    input.value = current;
+    input.maxLength = 60;
+    titleSpan.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    function finish(save) {
+      if (done) return;
+      done = true;
+      const newTitle = input.value.trim();
+      if (save && newTitle && newTitle !== current) {
+        post("renameTab", { tabId, newTitle });
+      } else {
+        renderTabBar();
+      }
+    }
+    input.addEventListener("blur", function() { finish(true); });
+    input.addEventListener("keydown", function(ev) {
+      if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+      if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+    });
+  }
+  function openTabPop() {
+    tabPopOpen = true;
+    els.tabpop.classList.remove("hidden");
+    renderTabPop();
+    const rb = document.querySelector(".tab-reopen");
+    if (rb) rb.classList.add("active");
+  }
+  function closeTabPop() {
+    tabPopOpen = false;
+    if (els.tabpop) els.tabpop.classList.add("hidden");
+    const rb = document.querySelector(".tab-reopen");
+    if (rb) rb.classList.remove("active");
+  }
+  function timeAgo(iso) {
+    if (!iso) return "";
+    try {
+      const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+      if (diff < 60) return "just now";
+      if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+      if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+      return Math.floor(diff / 86400) + "d ago";
+    } catch { return ""; }
+  }
+  function renderTabPop() {
+    if (!els.tabpop) return;
+    if (!closedTabList.length) {
+      els.tabpop.innerHTML = '<div style="padding:10px 12px;color:var(--fg-dim)">No recently closed tabs</div>';
+      return;
+    }
+    const totalPages = Math.ceil(closedTabList.length / CLOSED_TAB_PAGE_SIZE);
+    closedTabPage = Math.max(0, Math.min(closedTabPage, totalPages - 1));
+    const pageItems = closedTabList.slice(closedTabPage * CLOSED_TAB_PAGE_SIZE, (closedTabPage + 1) * CLOSED_TAB_PAGE_SIZE);
+    const truncate = function(s, n) { return s.length > n ? s.substring(0, n) + "…" : s; };
+    let h = '<div class="sec" style="padding:4px 8px">Recently closed</div>';
+    pageItems.forEach(function(item) {
+      const ago = timeAgo(item.closedAt);
+      const firstU = (item.firstUser || "").replace(/\n/g, " ");
+      const lastA = (item.lastAssist || "").replace(/\n/g, " ");
+      const tooltip = firstU ? firstU + (lastA ? " → " + lastA : "") : "";
+      const line1 = firstU ? truncate(firstU, 70) : "";
+      const line2 = lastA ? truncate(lastA, 70) : "";
+      h += '<button class="tabpop-item" data-tabid="' + window.md.esc(item.tabId) + '"'
+        + (tooltip ? ' title="' + window.md.esc(tooltip) + '"' : "") + ">"
+        + '<div class="tabpop-title">' + window.md.esc(item.title) + '<span class="tabpop-ago">' + window.md.esc(ago) + '</span></div>'
+        + (line1 ? '<div class="tabpop-line tabpop-user">' + window.md.esc(line1) + "</div>" : "")
+        + (line2 ? '<div class="tabpop-line tabpop-assist">' + window.md.esc(line2) + "</div>" : "")
+        + "</button>";
+    });
+    if (totalPages > 1) {
+      h += '<div class="tabpop-nav">'
+        + '<button class="tabpop-nav-btn" id="tabpop-prev" ' + (closedTabPage === 0 ? 'disabled' : '') + '>&#8249;</button>'
+        + '<span class="tabpop-nav-label">' + (closedTabPage + 1) + ' / ' + totalPages + '</span>'
+        + '<button class="tabpop-nav-btn" id="tabpop-next" ' + (closedTabPage >= totalPages - 1 ? 'disabled' : '') + '>&#8250;</button>'
+        + '</div>';
+    }
+    els.tabpop.innerHTML = h;
+    els.tabpop.querySelectorAll(".tabpop-item").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        closeTabPop();
+        post("reopenLastTab", { tabId: btn.dataset.tabid });
+      });
+    });
+    if (totalPages > 1) {
+      const prevBtn = els.tabpop.querySelector("#tabpop-prev");
+      const nextBtn = els.tabpop.querySelector("#tabpop-next");
+      if (prevBtn) prevBtn.addEventListener("click", function(e) { e.stopPropagation(); closedTabPage--; renderTabPop(); });
+      if (nextBtn) nextBtn.addEventListener("click", function(e) { e.stopPropagation(); closedTabPage++; renderTabPop(); });
+    }
   }
   // ── end tab management ──────────────────────────────────────────────────────
 
@@ -135,6 +253,12 @@
   function getDefaultMode() { try { return localStorage.getItem(MODE_PREF_KEY) || "default"; } catch { return "default"; } }
   function setDefaultMode(id) { try { localStorage.setItem(MODE_PREF_KEY, id); } catch {} }
   function isDefaultMode(id) { return id === getDefaultMode(); }
+
+  // ── Default effort preference (persisted in localStorage) ──────────────────
+  const EFFORT_PREF_KEY = "claudeDefaultEffort";
+  function getDefaultEffort() { try { return localStorage.getItem(EFFORT_PREF_KEY) || "none"; } catch { return "none"; } }
+  function setDefaultEffort(id) { try { localStorage.setItem(EFFORT_PREF_KEY, id); } catch {} }
+  function isDefaultEffort(id) { return id === getDefaultEffort(); }
   const totals = { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 };
   // `live` = ctx.used came from per-request usage (contextUsage) rather than the cumulative
   // turn totals in `result`, which overcount and must not win once real numbers are in.
@@ -157,6 +281,8 @@
   let inputHistory = [], histIndex = -1, histDraft = ""; // sent-input history; histIndex === -1 = live draft
   let acct = null;
   let thinkingVisible = true;
+  let forkWindowSize = 6;
+  let forkAllMessages = false;
 
   function post(type, payload) { if (api) api.postMessage({ type: type, payload: payload || {} }); }
   // Numbers-only breadcrumbs to the host log (%LOCALAPPDATA%\ClaudeCodeVS\session.log) — the
@@ -492,6 +618,8 @@
       if (p.permissionMode && cur.mode === "default") cur.mode = p.permissionMode;
       if (p.effort && cur.effort === "none") cur.effort = p.effort;
       if (typeof p.showThinking === "boolean") thinkingVisible = p.showThinking;
+      if (typeof p.forkWindowSize === "number") forkWindowSize = p.forkWindowSize;
+      if (typeof p.forkAllMessages === "boolean") forkAllMessages = p.forkAllMessages;
       syncUI();
       applyThinkingVisibility();
     },
@@ -631,9 +759,9 @@
           bgTab.totals.cacheReadTokens += +(p.cacheReadTokens || 0); bgTab.totals.cacheCreationTokens += +(p.cacheCreationTokens || 0);
           bgTab.usageText = [p.costUsd != null ? "$" + Number(p.costUsd).toFixed(4) : null, p.inputTokens != null ? p.inputTokens + " in" : null, p.outputTokens != null ? p.outputTokens + " out" : null, p.durationMs != null ? (p.durationMs / 1000).toFixed(1) + "s" : null].filter(Boolean).join(" · ");
           const fd = document.createElement("div"); fd.className = "fork-divider";
+          const _msgId = p.msgId || null;
           fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
-          const _keepCount = bgTab.totals.turns * 2;
-          fd.querySelector(".fork-btn").addEventListener("click", () => { post("forkTab", { count: _keepCount }); });
+          fd.querySelector(".fork-btn").addEventListener("click", () => { post("forkTab", { msgId: _msgId }); });
           bgTab.el.appendChild(fd);
         }
         return;
@@ -656,10 +784,10 @@
       if (topOpen === "usage") renderUsage();
       if (topOpen === "context") renderContext();
       const fd = document.createElement("div"); fd.className = "fork-divider";
+      const _msgId = p.msgId || null;
       fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
-      const _keepCount = totals.turns * 2;
       fd.querySelector(".fork-btn").addEventListener("click", () => {
-        post("forkTab", { count: _keepCount });
+        post("forkTab", { msgId: _msgId });
       });
       (msgRoot() || els.messages).appendChild(fd);
       scrollDown();
@@ -734,10 +862,10 @@
               b.innerHTML = window.md.render(m.text || ""); w.appendChild(b); bgTab.el.appendChild(w);
               bgTurnsSoFar++;
               const fd = document.createElement("div"); fd.className = "fork-divider";
+              const _msgId = m.id || null;
               fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
-              const _keepCount = bgTurnsSoFar * 2;
               fd.querySelector(".fork-btn").addEventListener("click", () => {
-                post("forkTab", { count: _keepCount });
+                post("forkTab", { msgId: _msgId });
               });
               bgTab.el.appendChild(fd);
             }
@@ -752,6 +880,8 @@
       if (p.mode) cur.mode = p.mode;
       if (p.effort) cur.effort = p.effort;
       if (typeof p.showThinking === "boolean") { thinkingVisible = p.showThinking; applyThinkingVisibility(); }
+      if (typeof p.forkWindowSize === "number") forkWindowSize = p.forkWindowSize;
+      if (typeof p.forkAllMessages === "boolean") forkAllMessages = p.forkAllMessages;
       // Restored model id may be an alias that needs remap once CLI list arrives.
       const activeTab = tabs.get(activeTabId);
       if (activeTab) { activeTab.modelReconciled = false; activeTab.cur = Object.assign({}, cur); }
@@ -770,10 +900,10 @@
           endTurn();
           turnsSoFar++;
           const fd = document.createElement("div"); fd.className = "fork-divider";
+          const _msgId = m.id || null;
           fd.innerHTML = '<button class="fork-btn" title="Fork conversation from here">⑂</button>';
-          const _keepCount = turnsSoFar * 2;
           fd.querySelector(".fork-btn").addEventListener("click", () => {
-            post("forkTab", { count: _keepCount });
+            post("forkTab", { msgId: _msgId });
           });
           root.appendChild(fd);
         }
@@ -793,7 +923,7 @@
       tab = createTab(p.tabId, p.title || "Chat");
       // New tabs inherit the stored default model (unless the host already resolved one).
       const dm = p.model || getDefaultModel();
-      tab.cur = { model: dm, mode: p.mode || getDefaultMode(), effort: "none" };
+      tab.cur = { model: dm, mode: p.mode || getDefaultMode(), effort: p.effort || getDefaultEffort() };
       if (p.active) { activeTabId = p.tabId; }
       else { tab.el.style.display = "none"; }
       diag("tabCreated: " + p.tabId + " active=" + !!p.active + " activeTabId=" + activeTabId + " tabs=" + tabs.size);
@@ -805,6 +935,13 @@
       const tab = tabs.get(p.tabId);
       if (tab) { tab.el.remove(); tabs.delete(p.tabId); }
       renderTabBar();
+    },
+    closedTabHistoryChanged: (p) => {
+      closedTabCount = (p && p.count) || 0;
+      closedTabList = (p && p.tabs) || [];
+      closedTabPage = 0;
+      renderTabBar();
+      if (tabPopOpen) renderTabPop();
     },
     updateTabTitle: (p) => {
       if (!p || !p.tabId) return;
@@ -1236,8 +1373,9 @@
   document.addEventListener("mousedown", (e) => {
     if (topOpen && !els.popover.contains(e.target) && !e.target.closest("#modelBtn,#contextBtn,#usageBtn")) closeTop();
     if (cOpen && !els.cpop.contains(e.target) && !e.target.closest("#plusBtn,#slashBtn,#modeBtn,#input")) closeC();
+    if (tabPopOpen && els.tabpop && !els.tabpop.contains(e.target) && !e.target.closest(".tab-reopen")) closeTabPop();
   });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAll(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeAll(); closeTabPop(); } });
   // If focus drifted to the document body (e.g. after an async clipboard write), redirect
   // printable keystrokes and Space back into the input so typing continues uninterrupted.
   document.addEventListener("keydown", (e) => {
@@ -1315,7 +1453,14 @@
     h += '<div class="opt' + (isCustom ? " sel" : "") + '" data-id="__custom"><div class="obody"><div class="oname">Custom model…</div><div class="odesc">' + window.md.esc(customLine) + '</div></div>' + (isCustom ? '<div class="ochk">✓</div>' : "") + "</div>";
     const ei = Math.max(0, efforts.findIndex((x) => x.id === cur.effort));
     const curName = (efforts[ei] || {}).name || "Off";
-    h += '<div class="effort-row"><div class="elabel">' + DUMBBELL + ' Effort <small id="effdesc">(' + window.md.esc(curName + " — " + effortDesc(cur.effort)) + ')</small></div><input type="range" class="effort-slider" id="effslider" min="0" max="' + (efforts.length - 1) + '" value="' + ei + '" /></div>';
+    const dfltEffortId = getDefaultEffort();
+    const dfltEffortIdx = Math.max(0, efforts.findIndex((x) => x.id === dfltEffortId));
+    let effortStars = "";
+    efforts.forEach((e, i) => {
+      const isOn = i === dfltEffortIdx;
+      effortStars += '<button class="effort-star' + (isOn ? " effort-star-on" : "") + '" data-effort="' + e.id + '" title="' + (isOn ? "Default effort for new tabs" : "Set “" + e.name + "” as default effort for new tabs") + '" aria-label="Set default effort to ' + e.name + '">★</button>';
+    });
+    h += '<div class="effort-row"><div class="elabel">' + DUMBBELL + ' Effort <small id="effdesc">(' + window.md.esc(curName + " — " + effortDesc(cur.effort)) + ')</small></div><div class="effort-ctrl"><input type="range" class="effort-slider" id="effslider" min="0" max="' + (efforts.length - 1) + '" value="' + ei + '" /><div class="effort-stars">' + effortStars + '</div></div></div>';
     showTop(h);
     els.popover.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", (e) => {
       if (e.target.classList.contains("model-star") || e.target.closest(".model-star")) return;
@@ -1335,6 +1480,12 @@
       const dd = els.popover.querySelector("#effdesc");
       if (dd) dd.textContent = "(" + e.name + " — " + effortDesc(e.id) + ")";
     });
+    els.popover.querySelectorAll(".effort-star").forEach((btn) => btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setDefaultEffort(btn.dataset.effort);
+      els.popover.querySelectorAll(".effort-star").forEach((b) => b.classList.toggle("effort-star-on", b.dataset.effort === btn.dataset.effort));
+      btn.title = "Default effort for new tabs";
+    }));
   }
 
   // Mirrors InputValidation.ModelIdShape on the host (which re-validates); this copy is UX only.
@@ -1675,6 +1826,8 @@
       h += '<div class="opt' + (m.id === cur.mode ? " sel" : "") + '" data-id="' + m.id + '"><div class="oicon">' + (m.icon || "") + '</div><div class="obody"><div class="oname">' + window.md.esc(m.name) + '</div><div class="odesc">' + window.md.esc(m.desc || "") + '</div></div>' + (m.id === cur.mode ? '<div class="ochk">✓</div>' : "") + '<button class="mode-star' + (isDflt ? " starred" : "") + '" data-star="' + m.id + '" title="' + starTitle + '">★</button></div>';
     });
     h += '<div class="effort-row"><div class="elabel">Show thinking <small>(stream reasoning)</small></div><button class="mini-toggle' + (thinkingVisible ? " on" : "") + '" id="thinkToggle">' + (thinkingVisible ? "On" : "Off") + '</button></div>';
+    h += '<div class="effort-row"><div class="elabel"><span class="eicon">⑂</span>Fork: copy last <input id="forkSizeInput" type="number" class="fork-size-input" min="1" max="200" value="' + forkWindowSize + '"' + (forkAllMessages ? ' disabled' : '') + '> msgs</div></div>';
+    h += '<div class="effort-row"><div class="elabel"><span class="eicon">⑂</span>Fork: copy all from start</div><button class="mini-toggle' + (forkAllMessages ? " on" : "") + '" id="forkAllToggle">' + (forkAllMessages ? "On" : "Off") + '</button></div>';
     showC(h);
     els.cpop.querySelectorAll(".opt").forEach((o) => o.addEventListener("click", (e) => {
       if (e.target.classList.contains("mode-star") || e.target.dataset.star) return;
@@ -1685,6 +1838,10 @@
     }));
     const tt = els.cpop.querySelector("#thinkToggle");
     if (tt) tt.addEventListener("click", () => { thinkingVisible = !thinkingVisible; post("setShowThinking", { on: thinkingVisible }); applyThinkingVisibility(); renderMode(); });
+    const fi = els.cpop.querySelector("#forkSizeInput");
+    if (fi) fi.addEventListener("change", () => { const v = Math.max(1, Math.min(200, parseInt(fi.value, 10) || 6)); forkWindowSize = v; post("setForkWindowSize", { size: v }); renderMode(); });
+    const fat = els.cpop.querySelector("#forkAllToggle");
+    if (fat) fat.addEventListener("click", () => { forkAllMessages = !forkAllMessages; post("setForkAllMessages", { on: forkAllMessages }); renderMode(); });
   }
 
   // ---- @-mention file picker ----
@@ -1983,6 +2140,7 @@
   document.getElementById("app").addEventListener("contextmenu", function(e) {
     e.preventDefault();
     closeCtxMenu();
+    const tabBtn = e.target.closest(".tab-btn[data-tab]");
     const m = document.createElement("div");
     m.className = "ctx-menu";
     const x = Math.min(e.clientX, window.innerWidth - 165);
@@ -1997,7 +2155,11 @@
       m.appendChild(b);
     }
     function ctxSep() { const s = document.createElement("div"); s.className = "ctx-sep"; m.appendChild(s); }
-    ctxItem("+ New tab", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode() }); });
+    if (tabBtn) {
+      ctxItem("✎ Rename tab", function() { startTabRename(tabBtn.dataset.tab); });
+      ctxSep();
+    }
+    ctxItem("+ New tab", function() { post("newTab", { defaultModel: getDefaultModel(), defaultMode: getDefaultMode(), defaultEffort: getDefaultEffort() }); });
     ctxSep();
     ctxItem("↺ New session", function() { post("newSession"); });
     document.body.appendChild(m);
@@ -2128,6 +2290,10 @@
       // Only intercept if the chat panel has focus (not the VS editor)
       e.preventDefault();
       openSearch();
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "T") {
+      e.preventDefault();
+      if (closedTabCount > 0) post("reopenLastTab", {});
     }
   });
   // ── end Ctrl+F search ─────────────────────────────────────────────────────

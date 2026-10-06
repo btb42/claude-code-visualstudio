@@ -19,7 +19,7 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", system-ui, sans-serif; font-size: 13px; color: var(--fg); background: var(--bg); }
-#app { display: flex; flex-direction: column; height: 100vh; position: relative; }
+#app { display: flex; flex-direction: column; height: 100%; position: relative; }
 
 /* Tab bar */
 #tab-bar { display: flex; align-items: stretch; overflow-x: auto; background: var(--bg-alt); border-bottom: 1px solid var(--border); flex: 0 0 auto; min-height: 0; scrollbar-width: none; }
@@ -29,12 +29,15 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .tab-btn.active { background: var(--bg); color: var(--fg); border-bottom: 2px solid var(--accent); }
 .tab-icon { color: var(--accent); font-size: 11px; flex: 0 0 auto; opacity: 0.8; }
 .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; min-width: 0; }
+.tab-rename-input { background: var(--bg-input); border: 1px solid var(--accent); border-radius: 2px; color: var(--fg); font: inherit; font-size: 12px; padding: 0 3px; width: 90px; outline: none; flex: 1 1 auto; min-width: 0; }
 .tab-run { color: var(--accent); font-size: 8px; flex: 0 0 auto; }
 .tab-close { opacity: 0; flex: 0 0 auto; font-size: 14px; line-height: 1; padding: 0 2px; border-radius: 3px; }
 .tab-btn:hover .tab-close, .tab-btn.active .tab-close { opacity: .6; }
 .tab-close:hover { opacity: 1 !important; background: var(--bg-input); }
 .tab-new { border: none; background: transparent; color: var(--fg-dim); font-size: 16px; line-height: 1; padding: 4px 10px; cursor: pointer; flex: 0 0 auto; }
 .tab-new:hover { color: var(--fg); background: var(--bg-input); }
+.tab-reopen { border: none; background: transparent; color: var(--accent); font-size: 16px; line-height: 1; padding: 4px 10px; cursor: pointer; flex: 0 0 auto; }
+.tab-reopen:hover { background: var(--bg-input); }
 .tab-pane { display: flex; flex-direction: column; gap: 12px; }
 .tbtn { background: transparent; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; height: 24px; cursor: pointer; font-size: 12px; }
 .tbtn:hover { background: var(--bg-input); }
@@ -332,15 +335,20 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 /* effort slider */
 .effort-row { display: flex; align-items: center; gap: 10px; padding: 8px; border-top: 1px solid var(--border); margin-top: 6px; }
 .effort-row .elabel { flex: 1; } .effort-row .elabel small { color: var(--fg-dim); }
-.dots { display: flex; gap: 8px; align-items: center; }
-.dots .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); cursor: pointer; }
-.dots .dot.on { background: var(--accent); }
+.effort-ctrl { display: flex; flex-direction: column; gap: 3px; }
+.effort-slider { -webkit-appearance: none; appearance: none; width: 130px; height: 6px; border-radius: 3px; background: var(--border); outline: none; cursor: pointer; }
+.effort-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-alt); cursor: pointer; }
+.effort-stars { display: flex; justify-content: space-between; width: 130px; padding: 0 8px; box-sizing: border-box; }
+.effort-star { width: 0; overflow: visible; text-align: center; background: none; border: none; cursor: pointer; font-size: 10px; color: var(--fg-dim); opacity: 0.25; padding: 0; line-height: 1; transition: opacity 0.1s, color 0.1s; }
+.effort-star:hover { opacity: 0.8 !important; color: var(--accent); }
+.effort-star.effort-star-on { opacity: 1; color: var(--accent); }
 .mini-toggle { background: transparent; color: var(--fg); border: 1px solid var(--border); border-radius: 12px; padding: 2px 12px; font-size: 11px; cursor: pointer; }
 .mini-toggle:hover { border-color: var(--accent); }
 .mini-toggle.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.fork-size-input { width: 44px; background: var(--bg-input); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-size: 12px; text-align: center; }
+.fork-size-input:focus { outline: none; border-color: var(--accent); }
+.fork-size-input:disabled { opacity: 0.4; cursor: not-allowed; }
 .elabel .eicon { vertical-align: -2px; margin-right: 4px; color: var(--fg-dim); }
-.effort-slider { -webkit-appearance: none; appearance: none; width: 130px; height: 6px; border-radius: 3px; background: var(--border); outline: none; cursor: pointer; }
-.effort-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-alt); cursor: pointer; }
 
 /* composer popover (bottom-anchored): + menu, / palette, mode */
 .cpop { position: absolute; bottom: 70px; left: 8px; right: 8px; max-height: 50%; overflow-y: auto; z-index: 60; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 -6px 28px rgba(0,0,0,.5); padding: 6px; font-size: 12px; }
@@ -392,3 +400,20 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .diag-copy { background: transparent; border: 1px solid var(--border); border-radius: 4px; color: var(--fg-dim); padding: 1px 6px; cursor: pointer; font-size: 11px; margin-left: 6px; }
 .diag-copy:hover { color: var(--fg); border-color: var(--fg-dim); }
 .diag-log { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; margin: 4px 0 0; padding: 6px 8px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: "Cascadia Code", Consolas, monospace; font-size: 10.5px; line-height: 1.4; color: var(--fg-dim); }
+
+/* Recently-closed-tabs popover — drops down from the tab bar */
+.tabpop { position: absolute; top: 31px; left: 0; right: 0; max-height: 55%; overflow-y: auto; z-index: 60; background: var(--bg-alt); border: 1px solid var(--border); border-top: none; border-radius: 0 0 8px 8px; box-shadow: 0 6px 28px rgba(0,0,0,.5); padding: 6px; font-size: 12px; }
+.tabpop-item { display: flex; flex-direction: column; gap: 3px; width: 100%; text-align: left; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; cursor: pointer; font-size: 12px; margin-bottom: 4px; }
+.tabpop-item:last-child { margin-bottom: 0; }
+.tabpop-item:hover { background: var(--bg-input); border-color: var(--fg-dim); }
+.tabpop-title { font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 8px; overflow: hidden; }
+.tabpop-ago { font-weight: 400; color: var(--fg-dim); font-size: 10.5px; flex-shrink: 0; }
+.tabpop-line { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tabpop-user { color: var(--fg); }
+.tabpop-assist { color: var(--fg-dim); }
+.tabpop-nav { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 4px 0 2px; }
+.tabpop-nav-btn { background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px; padding: 1px 8px; font-size: 14px; cursor: pointer; line-height: 1.4; }
+.tabpop-nav-btn:hover:not(:disabled) { background: var(--bg-input); border-color: var(--fg-dim); }
+.tabpop-nav-btn:disabled { opacity: 0.3; cursor: default; }
+.tabpop-nav-label { font-size: 11px; color: var(--fg-dim); min-width: 36px; text-align: center; }
+.tab-reopen.active { color: var(--fg); background: var(--bg-input); }

@@ -12,6 +12,7 @@ namespace ClaudeCode.VisualStudio.Services
     {
         public string Role { get; set; }   // "user" | "assistant"
         public string Text { get; set; }
+        public string Id { get; set; }     // short GUID, set for assistant messages only
     }
 
     public sealed class SessionRecord
@@ -23,6 +24,9 @@ namespace ClaudeCode.VisualStudio.Services
         public string Mode { get; set; } = "default";
         public string Effort { get; set; } = "none";
         public bool ShowThinking { get; set; } = true;
+        public int ForkWindowSize { get; set; } = 6;
+        public bool ForkAllMessages { get; set; } = false;
+        public string ClosedAt { get; set; }
         public List<StoredMessage> Messages { get; set; } = new List<StoredMessage>();
     }
 
@@ -33,6 +37,7 @@ namespace ClaudeCode.VisualStudio.Services
     {
         public List<SessionRecord> Tabs { get; set; } = new List<SessionRecord>();
         public string ActiveTabId { get; set; }
+        public List<SessionRecord> ClosedTabs { get; set; } = new List<SessionRecord>();
     }
 
     /// <summary>
@@ -154,15 +159,37 @@ namespace ClaudeCode.VisualStudio.Services
                 if (!File.Exists(path)) return null;
                 var json = ReadDecrypted(path);
                 if (json == null) return null;
+                SessionBundle bundle;
                 if (json.TrimStart().StartsWith("{\"Tabs\"", StringComparison.OrdinalIgnoreCase) ||
                     json.TrimStart().StartsWith("{\"tabs\"", StringComparison.OrdinalIgnoreCase))
-                    return JsonSerializer.Deserialize<SessionBundle>(json);
-                var rec = JsonSerializer.Deserialize<SessionRecord>(json);
-                if (rec == null) return null;
-                if (rec.TabId == null) rec.TabId = "t1";
-                return new SessionBundle { Tabs = new List<SessionRecord> { rec }, ActiveTabId = rec.TabId };
+                {
+                    bundle = JsonSerializer.Deserialize<SessionBundle>(json);
+                }
+                else
+                {
+                    var rec = JsonSerializer.Deserialize<SessionRecord>(json);
+                    if (rec == null) return null;
+                    if (rec.TabId == null) rec.TabId = "t1";
+                    bundle = new SessionBundle { Tabs = new List<SessionRecord> { rec }, ActiveTabId = rec.TabId };
+                }
+                BackfillMessageIds(bundle);
+                return bundle;
             }
             catch { return null; }
+        }
+
+        // Older sessions were stored before StoredMessage.Id existed; give every assistant
+        // message a stable id so fork buttons resolve to the right message instead of the tail.
+        private static void BackfillMessageIds(SessionBundle bundle)
+        {
+            if (bundle?.Tabs == null) return;
+            foreach (var rec in bundle.Tabs)
+            {
+                if (rec?.Messages == null) continue;
+                foreach (var m in rec.Messages)
+                    if (m.Role == "assistant" && string.IsNullOrEmpty(m.Id))
+                        m.Id = Guid.NewGuid().ToString("N").Substring(0, 8);
+            }
         }
 
         private static void SaveBundleNoLock(string path, SessionBundle bundle)
@@ -171,6 +198,10 @@ namespace ClaudeCode.VisualStudio.Services
             foreach (var rec in bundle.Tabs)
                 if (rec.Messages != null && rec.Messages.Count > MaxMessages)
                     rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
+            if (bundle.ClosedTabs != null)
+                foreach (var rec in bundle.ClosedTabs)
+                    if (rec.Messages != null && rec.Messages.Count > MaxMessages)
+                        rec.Messages.RemoveRange(0, rec.Messages.Count - MaxMessages);
             WriteEncrypted(path, JsonSerializer.Serialize(bundle));
         }
 
