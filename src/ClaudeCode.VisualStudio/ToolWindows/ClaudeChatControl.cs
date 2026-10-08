@@ -133,29 +133,21 @@ namespace ClaudeCode.VisualStudio
                     _webView.Focus();
                 }
 
-                // Text-navigation keys: VS binds End/Home (and sometimes arrow keys) to IDE
-                // document/tab navigation commands.  When WebView2 has focus the key was
-                // already delivered to its Win32 HWND, so the cursor moves correctly.
-                // Marking Handled here only prevents VS from also executing the IDE command
-                // (e.g. End jumping to a different editor tab, mouse cursor disappearing).
-                // Alt+Left/Right are let through — those are VS Navigate Back/Forward.
-                switch (e.Key)
+                // Home/End: VS binds these (including Alt variants) to IDE tab/document
+                // navigation. Marking them Handled stops VS from jumping away. WebView2
+                // receives the key via its WPF HwndHost path only when NOT handled, so we
+                // must re-inject via PostMessage after marking Handled.
+                // Arrow keys are intentionally NOT intercepted here — they work fine in
+                // WebView2 and intercepting them breaks cursor movement in the input.
+                if (e.Key == Key.Home || e.Key == Key.End)
                 {
-                    case Key.Home:
-                    case Key.End:
-                        // Intercept all modifier variants — Alt+End/Alt+Home also jump in VS.
-                        e.Handled = true;
-                        break;
-                    case Key.Left:
-                    case Key.Right:
-                    case Key.Up:
-                    case Key.Down:
-                    case Key.PageUp:
-                    case Key.PageDown:
-                        // Let Alt+Left/Right through for VS Navigate Back/Forward.
-                        if ((mod & ModifierKeys.Alt) == ModifierKeys.None)
-                            e.Handled = true;
-                        break;
+                    e.Handled = true;
+                    var focusedHwnd = NativeMethods.GetFocus();
+                    if (focusedHwnd != IntPtr.Zero)
+                    {
+                        var vk = (IntPtr)System.Windows.Input.KeyInterop.VirtualKeyFromKey(e.Key);
+                        NativeMethods.PostMessage(focusedHwnd, 0x0100 /*WM_KEYDOWN*/, vk, IntPtr.Zero);
+                    }
                 }
             };
 
@@ -2883,5 +2875,15 @@ namespace ClaudeCode.VisualStudio
             return new { count = _closedTabHistory.Count, tabs = items };
         }
         // ── end tab management ────────────────────────────────────────────────────────
+    }
+
+    internal static class NativeMethods
+    {
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        public static extern IntPtr GetFocus();
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     }
 }
