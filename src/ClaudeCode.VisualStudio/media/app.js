@@ -1279,8 +1279,8 @@
     if (cOpen === "at") { if (atKey(e)) return; }
     // Browse previously-sent inputs with Up/Down (shell-style): only when no popover is open,
     // and only at the edge lines so multi-line cursor movement still works normally.
-    if (!cOpen && e.key === "ArrowUp" && inputHistory.length && caretOnFirstLine()) { e.preventDefault(); histPrev(); return; }
-    if (!cOpen && e.key === "ArrowDown" && histIndex !== -1 && caretOnLastLine()) { e.preventDefault(); histNext(); return; }
+    if (!cOpen && e.key === "ArrowUp" && !e.shiftKey && inputHistory.length && caretOnFirstLine()) { e.preventDefault(); histPrev(); return; }
+    if (!cOpen && e.key === "ArrowDown" && !e.shiftKey && histIndex !== -1 && caretOnLastLine()) { e.preventDefault(); histNext(); return; }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
   els.input.addEventListener("paste", (e) => {
