@@ -45,6 +45,282 @@
     return s;
   }
 
+  // Keyword sets for the languages we recognise.
+  const KW = {
+    cpp: new Set(['auto','bool','break','case','catch','char','class','const','constexpr',
+      'continue','default','delete','do','double','else','enum','explicit','extern',
+      'false','float','for','friend','goto','if','inline','int','long','mutable',
+      'namespace','new','nullptr','operator','private','protected','public','register',
+      'return','short','signed','sizeof','static','struct','switch','template','this',
+      'throw','true','try','typedef','typename','union','unsigned','using','virtual',
+      'void','volatile','while']),
+    cs: new Set(['abstract','as','async','await','base','bool','break','byte','case',
+      'catch','char','checked','class','const','continue','decimal','default','delegate',
+      'do','double','else','enum','event','explicit','extern','false','finally','fixed',
+      'float','for','foreach','goto','if','implicit','in','int','interface','internal',
+      'is','lock','long','namespace','new','null','object','operator','out','override',
+      'params','private','protected','public','readonly','ref','return','sbyte','sealed',
+      'short','sizeof','stackalloc','static','string','struct','switch','this','throw',
+      'true','try','typeof','uint','ulong','unchecked','unsafe','ushort','using','var',
+      'virtual','void','volatile','while','yield','dynamic','nameof','when']),
+    js: new Set(['async','await','break','case','catch','class','const','continue',
+      'debugger','default','delete','do','else','export','extends','false','finally',
+      'for','from','function','if','import','in','instanceof','let','new','null','of',
+      'return','static','super','switch','this','throw','true','try','typeof','undefined',
+      'var','void','while','with','yield']),
+    css: new Set(['none','auto','inherit','initial','unset','revert',
+      'flex','grid','block','inline','inline-block','inline-flex','inline-grid','contents',
+      'relative','absolute','fixed','static','sticky',
+      'bold','normal','italic','oblique',
+      'hidden','visible','transparent','solid','dashed','dotted','double','groove','ridge',
+      'center','left','right','top','bottom','middle','baseline','stretch',
+      'nowrap','wrap','wrap-reverse','row','column','row-reverse','column-reverse',
+      'space-between','space-around','space-evenly','flex-start','flex-end',
+      'contain','cover','fill','no-repeat','repeat','repeat-x','repeat-y',
+      'pointer','default','text','crosshair','not-allowed','grab','grabbing',
+      'uppercase','lowercase','capitalize',
+      'underline','line-through','overline',
+      'scroll','hidden','clip','ellipsis','collapse','separate',
+      'ease','linear','ease-in','ease-out','ease-in-out','forwards','backwards','both',
+      'border-box','content-box','padding-box']),
+    json: new Set(['true','false','null']),
+    sql: new Set(['SELECT','FROM','WHERE','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
+      'CREATE','DROP','ALTER','TABLE','VIEW','INDEX','PROCEDURE','FUNCTION','TRIGGER',
+      'JOIN','INNER','LEFT','RIGHT','FULL','OUTER','CROSS','ON','AS','AND','OR','NOT',
+      'NULL','IS','IN','BETWEEN','LIKE','EXISTS','ANY','ALL','UNION','INTERSECT','EXCEPT',
+      'ORDER','BY','GROUP','HAVING','DISTINCT','TOP','LIMIT','OFFSET','FETCH','NEXT',
+      'ROWS','ONLY','CASE','WHEN','THEN','ELSE','END','IF','BEGIN','COMMIT','ROLLBACK',
+      'TRANSACTION','DECLARE','EXEC','EXECUTE','PRINT','RETURN','GO','USE','DATABASE',
+      'PRIMARY','FOREIGN','KEY','REFERENCES','CONSTRAINT','DEFAULT','UNIQUE','CHECK',
+      'CASCADE','WITH','NOLOCK','NOCOUNT','OUTPUT','OVER','PARTITION','ROW_NUMBER',
+      'RANK','DENSE_RANK','COUNT','SUM','AVG','MIN','MAX','COALESCE','ISNULL',
+      'CAST','CONVERT','LEN','SUBSTRING','REPLACE','GETDATE','NEWID','SCOPE_IDENTITY',
+      'INT','BIGINT','SMALLINT','TINYINT','DECIMAL','NUMERIC','FLOAT','REAL','MONEY',
+      'VARCHAR','NVARCHAR','CHAR','NCHAR','TEXT','NTEXT','BIT','DATETIME','DATE','TIME',
+      'UNIQUEIDENTIFIER','VARBINARY','IMAGE']),
+    py: new Set(['False','None','True','and','as','assert','async','await','break','class',
+      'continue','def','del','elif','else','except','finally','for','from','global','if',
+      'import','in','is','lambda','nonlocal','not','or','pass','raise','return','try',
+      'while','with','yield'])
+  };
+
+  function langFamily(lang) {
+    var l = (lang || '').toLowerCase();
+    if (l === 'cpp' || l === 'c++' || l === 'c' || l === 'h' || l === 'cxx' || l === 'cc') return 'cpp';
+    if (l === 'csharp' || l === 'cs' || l === 'c#') return 'cs';
+    if (l === 'js' || l === 'javascript' || l === 'ts' || l === 'typescript' || l === 'jsx' || l === 'tsx') return 'js';
+    if (l === 'css' || l === 'scss' || l === 'less') return 'css';
+    if (l === 'json' || l === 'jsonc') return 'json';
+    if (l === 'sql' || l === 'tsql' || l === 'plsql' || l === 'mysql') return 'sql';
+    if (l === 'py' || l === 'python' || l === 'python3') return 'py';
+    if (l === 'xml' || l === 'html' || l === 'htm' || l === 'xhtml' || l === 'svg' || l === 'xaml') return 'xml';
+    return null;
+  }
+
+  // XML/HTML state-machine highlighter — tag-aware, attribute-aware.
+  function highlightXml(code) {
+    var out = '';
+    var i = 0;
+    var n = code.length;
+    try {
+      while (i < n) {
+        // HTML comment <!-- ... -->
+        if (code.slice(i, i + 4) === '<!--') {
+          var ec = code.indexOf('-->', i + 4);
+          var sc = ec === -1 ? code.slice(i) : code.slice(i, ec + 3);
+          out += '<span class="tok-cmt">' + esc(sc) + '</span>';
+          i += sc.length; continue;
+        }
+        // CDATA section
+        if (code.slice(i, i + 9) === '<![CDATA[') {
+          var ecd = code.indexOf(']]>', i + 9);
+          var scd = ecd === -1 ? code.slice(i) : code.slice(i, ecd + 3);
+          out += '<span class="tok-str">' + esc(scd) + '</span>';
+          i += scd.length; continue;
+        }
+        // Tag start
+        if (code[i] === '<') {
+          out += '<span class="tok-pp">&lt;</span>'; i++;
+          // closing slash </tag>
+          if (i < n && code[i] === '/') { out += '<span class="tok-pp">/</span>'; i++; }
+          // tag name
+          var tn = i;
+          while (tn < n && /[a-zA-Z0-9:_.-]/.test(code[tn])) tn++;
+          if (tn > i) { out += '<span class="tok-kw">' + esc(code.slice(i, tn)) + '</span>'; i = tn; }
+          // attributes until > or />
+          while (i < n && code[i] !== '>') {
+            if (code[i] === '/' && i + 1 < n && code[i + 1] === '>') {
+              out += '<span class="tok-pp">/&gt;</span>'; i += 2; break;
+            }
+            if (/[a-zA-Z_:.-]/.test(code[i])) {
+              var an = i;
+              while (an < n && /[a-zA-Z0-9_:.-]/.test(code[an])) an++;
+              out += '<span class="tok-prop">' + esc(code.slice(i, an)) + '</span>'; i = an; continue;
+            }
+            if (code[i] === '"' || code[i] === "'") {
+              var qa = code[i]; var ja = i + 1;
+              while (ja < n && code[ja] !== qa) ja++;
+              if (ja < n) ja++;
+              out += '<span class="tok-str">' + esc(code.slice(i, ja)) + '</span>'; i = ja; continue;
+            }
+            out += esc(code[i]); i++;
+          }
+          if (i < n && code[i] === '>') { out += '<span class="tok-pp">&gt;</span>'; i++; }
+          continue;
+        }
+        // XML entity reference &amp; &lt; &gt; &#160; …
+        if (code[i] === '&') {
+          var je = i + 1;
+          while (je < n && code[je] !== ';' && code[je] !== '<' && je - i < 12) je++;
+          if (je < n && code[je] === ';') {
+            out += '<span class="tok-num">' + esc(code.slice(i, je + 1)) + '</span>'; i = je + 1; continue;
+          }
+        }
+        out += esc(code[i]); i++;
+      }
+    } catch (_) { return esc(code); }
+    return out;
+  }
+
+  // Tokenise `code` (raw, not HTML-escaped) and return highlighted HTML.
+  function highlight(lang, code) {
+    var family = langFamily(lang);
+    if (family === 'xml') return highlightXml(code);
+    var kw = family ? KW[family] : null;
+    var isCpp = family === 'cpp';
+    var isCss = family === 'css';
+    var isJson = family === 'json';
+    var isSql = family === 'sql';
+    var isPy = family === 'py';
+    var out = '';
+    var i = 0;
+    var n = code.length;
+    try {
+      while (i < n) {
+        var c = code[i];
+        // SQL line comment --
+        if (isSql && c === '-' && i + 1 < n && code[i + 1] === '-') {
+          var e = code.indexOf('\n', i);
+          var seg = e === -1 ? code.slice(i) : code.slice(i, e);
+          out += '<span class="tok-cmt">' + esc(seg) + '</span>';
+          i += seg.length; continue;
+        }
+        // Python / Shell line comment #
+        if (isPy && c === '#') {
+          var e = code.indexOf('\n', i);
+          var seg = e === -1 ? code.slice(i) : code.slice(i, e);
+          out += '<span class="tok-cmt">' + esc(seg) + '</span>';
+          i += seg.length; continue;
+        }
+        // Line comment //
+        if (c === '/' && i + 1 < n && code[i + 1] === '/') {
+          var e = code.indexOf('\n', i);
+          var seg = e === -1 ? code.slice(i) : code.slice(i, e);
+          out += '<span class="tok-cmt">' + esc(seg) + '</span>';
+          i += seg.length; continue;
+        }
+        // Block comment /* */
+        if (c === '/' && i + 1 < n && code[i + 1] === '*') {
+          var e2 = code.indexOf('*/', i + 2);
+          var seg2 = e2 === -1 ? code.slice(i) : code.slice(i, e2 + 2);
+          out += '<span class="tok-cmt">' + esc(seg2) + '</span>';
+          i += seg2.length; continue;
+        }
+        // Preprocessor directives #include, #define …
+        if (isCpp && c === '#' && (i === 0 || code[i - 1] === '\n')) {
+          var e3 = code.indexOf('\n', i);
+          var seg3 = e3 === -1 ? code.slice(i) : code.slice(i, e3);
+          out += '<span class="tok-pp">' + esc(seg3) + '</span>';
+          i += seg3.length; continue;
+        }
+        // CSS @at-rules: @media, @import, @keyframes …
+        if (isCss && c === '@') {
+          var ka = i + 1;
+          while (ka < n && /[a-zA-Z-]/.test(code[ka])) ka++;
+          out += '<span class="tok-pp">' + esc(code.slice(i, ka)) + '</span>';
+          i = ka; continue;
+        }
+        // CSS hex colours: #rgb, #rgba, #rrggbb, #rrggbbaa
+        if (isCss && c === '#') {
+          var kh = i + 1;
+          while (kh < n && /[0-9a-fA-F]/.test(code[kh])) kh++;
+          var hlen = kh - i - 1;
+          if (hlen === 3 || hlen === 4 || hlen === 6 || hlen === 8) {
+            out += '<span class="tok-num">' + esc(code.slice(i, kh)) + '</span>';
+            i = kh; continue;
+          }
+          out += esc(c); i++; continue; // ID selector, not a colour
+        }
+        // Python triple-quoted strings """ or '''
+        if (isPy && (c === '"' || c === "'") && i + 2 < n && code[i+1] === c && code[i+2] === c) {
+          var q3 = c + c + c;
+          var et = code.indexOf(q3, i + 3);
+          var st = et === -1 ? code.slice(i) : code.slice(i, et + 3);
+          out += '<span class="tok-str">' + esc(st) + '</span>';
+          i += st.length; continue;
+        }
+        // String literals " ' ` — JSON keys get tok-prop, values get tok-str
+        if (c === '"' || c === "'" || c === '`') {
+          var q = c;
+          var j = i + 1;
+          while (j < n) {
+            if (code[j] === '\\') { j += 2; continue; }
+            if (code[j] === q) { j++; break; }
+            if (code[j] === '\n' && q !== '`') break;
+            j++;
+          }
+          var cls = 'tok-str';
+          if (isJson && q === '"') {
+            var pk = j;
+            while (pk < n && (code[pk] === ' ' || code[pk] === '\t')) pk++;
+            if (pk < n && code[pk] === ':') cls = 'tok-prop';
+          }
+          out += '<span class="' + cls + '">' + esc(code.slice(i, j)) + '</span>';
+          i = j; continue;
+        }
+        // Numbers — for CSS also consume unit suffix (px, em, rem, %, vw, vh …)
+        if (/[0-9]/.test(c) || (c === '.' && i + 1 < n && /[0-9]/.test(code[i + 1]))) {
+          var kn = i;
+          while (kn < n && /[0-9a-fA-FxXoObBlLuUfFdD._]/.test(code[kn])) kn++;
+          if (isCss) { while (kn < n && /[a-zA-Z%]/.test(code[kn])) kn++; }
+          out += '<span class="tok-num">' + esc(code.slice(i, kn)) + '</span>';
+          i = kn; continue;
+        }
+        // CSS identifiers: property names (before ':') get tok-prop, value keywords get tok-kw
+        if (isCss && /[a-zA-Z_]/.test(c)) {
+          var ki = i;
+          while (ki < n && /[a-zA-Z0-9_-]/.test(code[ki])) ki++;
+          var word = code.slice(i, ki);
+          var pk2 = ki;
+          while (pk2 < n && (code[pk2] === ' ' || code[pk2] === '\t')) pk2++;
+          var isProp = pk2 < n && code[pk2] === ':' && (pk2 + 1 >= n || code[pk2 + 1] !== ':');
+          if (isProp) {
+            out += '<span class="tok-prop">' + esc(word) + '</span>';
+          } else if (kw && kw.has(word)) {
+            out += '<span class="tok-kw">' + esc(word) + '</span>';
+          } else {
+            out += esc(word);
+          }
+          i = ki; continue;
+        }
+        // General identifiers / keywords — SQL is case-insensitive
+        if (/[a-zA-Z_$]/.test(c)) {
+          var k2 = i;
+          while (k2 < n && /[a-zA-Z0-9_$]/.test(code[k2])) k2++;
+          var word2 = code.slice(i, k2);
+          var isKw = kw && (kw.has(word2) || (isSql && kw.has(word2.toUpperCase())));
+          out += isKw ? '<span class="tok-kw">' + esc(word2) + '</span>' : esc(word2);
+          i = k2; continue;
+        }
+        out += esc(c);
+        i++;
+      }
+    } catch (_) {
+      return esc(code); // safety fallback
+    }
+    return out;
+  }
+
   // A fenced block renders as a header bar (language on the left, a copy button on the right)
   // sitting on top of the <pre>. The button is always visible rather than hover-only: the point
   // of it is that a suggested command can be taken without hand-selecting the text, and on a
@@ -57,10 +333,11 @@
     '<rect x="2.5" y="5.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2" /></svg>';
 
   function codeBlock(lang, code) {
+    var body = langFamily(lang) ? highlight(lang, code) : esc(code);
     return '<div class="cblock"><div class="cbar"><span class="clang">' + esc(lang) + '</span>' +
       '<button type="button" class="ccopy" title="Copy code">' + COPY_ICON +
       '<span class="clabel">Copy</span></button></div>' +
-      '<pre data-lang="' + esc(lang) + '"><code>' + esc(code) + '</code></pre></div>';
+      '<pre data-lang="' + esc(lang) + '"><code>' + body + '</code></pre></div>';
   }
 
   function render(md) {
