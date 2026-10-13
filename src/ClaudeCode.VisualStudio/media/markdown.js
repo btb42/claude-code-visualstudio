@@ -114,7 +114,88 @@
     if (l === 'sql' || l === 'tsql' || l === 'plsql' || l === 'mysql') return 'sql';
     if (l === 'py' || l === 'python' || l === 'python3') return 'py';
     if (l === 'xml' || l === 'html' || l === 'htm' || l === 'xhtml' || l === 'svg' || l === 'xaml') return 'xml';
+    if (l === 'md' || l === 'markdown') return 'md';
     return null;
+  }
+
+  // Markdown inline: bold, inline-code, links — called from highlightMarkdown line processor.
+  function mdInline(s) {
+    var out = ''; var i = 0; var n = s.length;
+    while (i < n) {
+      // Inline code `...`
+      if (s[i] === '`') {
+        var j = s.indexOf('`', i + 1);
+        if (j !== -1) { out += '<span class="tok-str">' + esc(s.slice(i, j + 1)) + '</span>'; i = j + 1; continue; }
+      }
+      // Bold **...**
+      if (s[i] === '*' && i + 1 < n && s[i + 1] === '*') {
+        var j = s.indexOf('**', i + 2);
+        if (j !== -1) { out += '<span class="tok-kw">' + esc(s.slice(i, j + 2)) + '</span>'; i = j + 2; continue; }
+      }
+      // Image ![alt](url)
+      if (s[i] === '!' && i + 1 < n && s[i + 1] === '[') {
+        var cb = s.indexOf(']', i + 2);
+        if (cb !== -1 && cb + 1 < n && s[cb + 1] === '(') {
+          var cp = s.indexOf(')', cb + 2);
+          if (cp !== -1) {
+            out += '<span class="tok-pp">!</span><span class="tok-prop">' + esc(s.slice(i + 1, cb + 1)) + '</span>' +
+                   '<span class="tok-str">' + esc(s.slice(cb + 1, cp + 1)) + '</span>';
+            i = cp + 1; continue;
+          }
+        }
+      }
+      // Link [text](url)
+      if (s[i] === '[') {
+        var cb = s.indexOf(']', i + 1);
+        if (cb !== -1 && cb + 1 < n && s[cb + 1] === '(') {
+          var cp = s.indexOf(')', cb + 2);
+          if (cp !== -1) {
+            out += '<span class="tok-prop">' + esc(s.slice(i, cb + 1)) + '</span>' +
+                   '<span class="tok-str">' + esc(s.slice(cb + 1, cp + 1)) + '</span>';
+            i = cp + 1; continue;
+          }
+        }
+      }
+      out += esc(s[i]); i++;
+    }
+    return out;
+  }
+
+  // Markdown line-oriented highlighter: headings, blockquotes, lists, fences, HR, inline markup.
+  function highlightMarkdown(code) {
+    var lines = code.split('\n');
+    var out = '';
+    var inFence = false;
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li];
+      if (li > 0) out += '\n';
+      // Code fence ``` or ~~~
+      if (/^(`{3,}|~{3,})/.test(line)) {
+        out += '<span class="tok-pp">' + esc(line) + '</span>';
+        inFence = !inFence; continue;
+      }
+      // Inside a fenced block — leave as-is
+      if (inFence) { out += esc(line); continue; }
+      // Horizontal rule --- *** ___
+      if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(line)) { out += '<span class="tok-pp">' + esc(line) + '</span>'; continue; }
+      // ATX heading # ## ...
+      var hm = line.match(/^(#{1,6})(\s+.*)$/);
+      if (hm) { out += '<span class="tok-kw">' + esc(hm[1]) + '</span>' + mdInline(hm[2]); continue; }
+      // Setext heading underline === or ---
+      if (/^(={3,}|-{3,})\s*$/.test(line)) { out += '<span class="tok-kw">' + esc(line) + '</span>'; continue; }
+      // Blockquote > ...
+      var bq = line.match(/^(>+\s?)(.*)$/);
+      if (bq) { out += '<span class="tok-cmt">' + esc(bq[1]) + '</span>' + mdInline(bq[2]); continue; }
+      // Unordered list item - * +
+      var ul = line.match(/^(\s*)([-*+])(\s+.*)$/);
+      if (ul) { out += esc(ul[1]) + '<span class="tok-kw">' + esc(ul[2]) + '</span>' + mdInline(ul[3]); continue; }
+      // Ordered list item 1. 2. ...
+      var ol = line.match(/^(\s*)(\d+\.)(\s+.*)$/);
+      if (ol) { out += esc(ol[1]) + '<span class="tok-kw">' + esc(ol[2]) + '</span>' + mdInline(ol[3]); continue; }
+      // Plain line with inline markup
+      out += mdInline(line);
+    }
+    return out;
   }
 
   // XML/HTML state-machine highlighter — tag-aware, attribute-aware.
@@ -186,6 +267,7 @@
   function highlight(lang, code) {
     var family = langFamily(lang);
     if (family === 'xml') return highlightXml(code);
+    if (family === 'md') return highlightMarkdown(code);
     var kw = family ? KW[family] : null;
     var isCpp = family === 'cpp';
     var isCss = family === 'css';
