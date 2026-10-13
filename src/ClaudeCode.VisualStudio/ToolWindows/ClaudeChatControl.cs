@@ -134,20 +134,17 @@ namespace ClaudeCode.VisualStudio
                 }
 
                 // Home/End: VS binds these (including Alt variants) to IDE tab/document
-                // navigation. Marking them Handled stops VS from jumping away. WebView2
-                // receives the key via its WPF HwndHost path only when NOT handled, so we
-                // must re-inject via PostMessage after marking Handled.
-                // Arrow keys are intentionally NOT intercepted here — they work fine in
-                // WebView2 and intercepting them breaks cursor movement in the input.
+                // navigation. Marking Handled stops VS from jumping away. We re-deliver the
+                // cursor move via ExecuteScriptAsync so the textarea still responds normally.
+                // Arrow keys are NOT intercepted — they work fine without intervention.
                 if (e.Key == Key.Home || e.Key == Key.End)
                 {
                     e.Handled = true;
-                    var focusedHwnd = NativeMethods.GetFocus();
-                    if (focusedHwnd != IntPtr.Zero)
-                    {
-                        var vk = (IntPtr)System.Windows.Input.KeyInterop.VirtualKeyFromKey(e.Key);
-                        NativeMethods.PostMessage(focusedHwnd, 0x0100 /*WM_KEYDOWN*/, vk, IntPtr.Zero);
-                    }
+                    var navKey = e.Key == Key.Home ? "home" : "end";
+                    var navShift = (mod & ModifierKeys.Shift) != 0 ? "true" : "false";
+                    var navCtrl = (mod & ModifierKeys.Control) != 0 ? "true" : "false";
+                    _ = _webView.CoreWebView2?.ExecuteScriptAsync(
+                        $"window._claudeNavKey('{navKey}',{navShift},{navCtrl})");
                 }
             };
 
@@ -2875,15 +2872,5 @@ namespace ClaudeCode.VisualStudio
             return new { count = _closedTabHistory.Count, tabs = items };
         }
         // ── end tab management ────────────────────────────────────────────────────────
-    }
-
-    internal static class NativeMethods
-    {
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        public static extern IntPtr GetFocus();
-
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
-        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     }
 }

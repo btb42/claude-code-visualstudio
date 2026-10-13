@@ -2301,4 +2301,21 @@
   updateRing();
   applyThinkingVisibility();
   post("ready");
+
+  // Called from C# PreviewKeyDown to handle Home/End keys inside the textarea.
+  // C# intercepts them (e.Handled=true) to prevent VS from navigating tabs,
+  // then re-delivers via ExecuteScriptAsync so cursor movement still works.
+  window._claudeNavKey = function(key, shift, ctrl) {
+    var el = document.activeElement;
+    if (!el || (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT')) return;
+    var val = el.value, ss = el.selectionStart, se = el.selectionEnd, pos;
+    if (key === 'home') {
+      pos = ctrl ? 0 : val.lastIndexOf('\n', ss - 1) + 1;
+      el.setSelectionRange(pos, shift ? se : pos, shift ? 'backward' : 'none');
+    } else {
+      var nl = val.indexOf('\n', se);
+      pos = ctrl ? val.length : (nl < 0 ? val.length : nl);
+      el.setSelectionRange(shift ? ss : pos, pos, shift ? 'forward' : 'none');
+    }
+  };
 })();
