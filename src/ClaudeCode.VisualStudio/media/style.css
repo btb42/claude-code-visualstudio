@@ -91,6 +91,7 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Segoe UI", syste
 .msg .bubble h1 { font-size: 1.4em; } .msg .bubble h2 { font-size: 1.25em; } .msg .bubble h3 { font-size: 1.1em; }
 .msg .bubble h4, .msg .bubble h5, .msg .bubble h6 { font-size: 1em; }
 .msg .bubble h2 { border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.msg .bubble blockquote, .node-main blockquote { border-left: 3px solid var(--accent); margin: 6px 0; padding: 4px 12px; background: rgba(204,122,59,.07); color: var(--fg-strong); border-radius: 0 4px 4px 0; }
 .msg .bubble table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
 .msg .bubble th, .msg .bubble td { border: 1px solid var(--border); padding: 6px 10px; }
 .msg .bubble th { background: var(--code-bg); font-weight: 600; }
